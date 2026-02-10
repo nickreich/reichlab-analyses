@@ -1,0 +1,441 @@
+---
+title: "Scoring Probabilistic Forecasts Across Multiple Locations"
+subtitle: "Exploring the variogram score, allocation score, and related multivariate proper scoring rules"
+author: "Claude (Anthropic)"
+date: "2026-02-10"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 7
+)
+knitr::opts_knit$set(root.dir = here::here())
+library(ggplot2)
+library(patchwork)
+```
+
+## Motivation
+
+Standard forecast evaluation in epidemiology scores each location independently.
+The weighted interval score (WIS) or continuous ranked probability score (CRPS) is computed per location, then averaged.
+This approach has a fundamental blind spot: it ignores whether the forecast correctly captures **relative differences across locations**.
+
+Consider a public health agency distributing a limited supply of antivirals across 50 cities.
+What matters for that decision is not whether the forecast for each city is close to the truth in absolute terms, but whether the forecast correctly identifies which cities will be hit hardest relative to others.
+A model that overshoots everywhere by the same amount gives perfect allocation guidance; a model that is closer on average but swaps the rankings of two cities could lead to wasted resources.
+
+This notebook explores scoring rules that evaluate forecasts across multiple locations simultaneously, with particular focus on the **variogram score** and its relationship to the **allocation score** proposed by Gerding et al. (2024).
+
+## Background: Scoring Rules That Evaluate Cross-Location Structure
+
+### The problem with summing WIS across locations
+
+The WIS (Bracher et al., 2021) is a proper scoring rule that approximates the CRPS.
+When applied to multi-location forecasts, standard practice is to compute WIS separately for each location and sum (or average) the results.
+This is equivalent to evaluating the **marginal** distributions independently --- it cannot detect whether the forecast correctly captures the joint structure across locations.
+
+Two forecasts that predict identical marginal distributions for each location but wildly different correlation structures receive the same summed-WIS score.
+
+### Scores that go beyond marginals
+
+Several scoring rules have been developed that evaluate the joint distribution across locations.
+They differ in what aspects of the joint distribution they target:
+
+| Score | What it evaluates | Software |
+|-------|-------------------|----------|
+| **Energy Score** | Full joint distribution via Euclidean distances (but weakly sensitive to dependence) | R: `scoringRules::es_sample()`, Python: `scoringrules` |
+| **Variogram Score** | Pairwise differences between locations (targets dependence structure) | R: `scoringRules::vs_sample()`, Python: `scoringrules` |
+| **Multivariate Dawid-Sebastiani** | Mean vector and covariance matrix (linear dependence only) | Manual computation required |
+| **Allocation Score** | Decision-optimal resource distribution across locations | R: `alloscore` (GitHub) |
+
+This notebook focuses on the variogram score because it is (a) directly sensitive to cross-location relative structure, (b) available in standard software, and (c) conceptually connected to allocation decisions despite not being explicitly decision-theoretic.
+
+## The Variogram Score: Definition
+
+The variogram score was introduced by Scheuerer and Hamill (2015) as a proper scoring rule for multivariate probabilistic forecasts, drawing on the geostatistical concept of variograms.
+
+### Mathematical definition
+
+For a probabilistic forecast $F$ over $N$ locations and an observation vector $\mathbf{y} = (y_1, \ldots, y_N)$, the variogram score of order $p$ is:
+
+$$
+\text{VS}_p(F, \mathbf{y}) = \sum_{i=1}^{N} \sum_{j=i+1}^{N} w_{ij} \left( \mathbb{E}_F\!\left[|X_i - X_j|^p\right] - |y_i - y_j|^p \right)^2
+$$
+
+where:
+
+- $X_i, X_j$ are random variables drawn from the forecast distribution $F$
+- $w_{ij} \geq 0$ are weights (typically $w_{ij} = 1$ for all pairs)
+- $p > 0$ controls the order (common choices: $p = 0.5$ or $p = 1$)
+
+**Lower scores are better.** The score is zero when the forecast's pairwise difference structure exactly matches the observations.
+
+For a **deterministic (point) forecast** $\mathbf{f}$, the expectation collapses and the score simplifies to:
+
+$$
+\text{VS}_p(\mathbf{f}, \mathbf{y}) = \sum_{i < j} w_{ij} \left( |f_i - f_j|^p - |y_i - y_j|^p \right)^2
+$$
+
+### Key properties
+
+1. **Proper scoring rule**: Forecasters are incentivized to report their true beliefs. (But *not* strictly proper --- it cannot uniquely identify the true distribution.)
+2. **Invariant to additive shifts**: Adding a constant to all forecasts does not change any pairwise difference, so the score is unchanged. A model with perfect relative structure but constant bias scores as well as a perfect model.
+3. **Sensitive to dependence structure**: Unlike the energy score, the variogram score directly targets whether the forecast captures the correct pairwise relationships across locations.
+4. **Not invariant to multiplicative scaling**: Multiplying all forecasts by a constant scales all pairwise differences, which *does* change the score (see Example 2 below).
+
+### Connection to the allocation score
+
+The allocation score (Gerding et al., 2024) evaluates forecasts by how well they guide optimal resource allocation across locations.
+It derives from a decision-theoretic framework: given a fixed resource budget $K$, allocate to minimize expected unmet need, then score by actual unmet need under that allocation.
+
+The allocation score and the variogram score are sensitive to overlapping but distinct aspects of multi-location forecasts:
+
+- Both care about **relative structure** across locations rather than absolute accuracy per location.
+- The allocation score is explicitly decision-theoretic and evaluates the full optimization problem.
+- The variogram score is a statistical scoring rule that evaluates pairwise difference magnitudes.
+- Neither has been formally compared to the other in the literature as of February 2026.
+
+## Worked Examples
+
+The following examples use deterministic point forecasts for clarity.
+The same principles apply to probabilistic forecasts, where the expected pairwise differences under the forecast distribution replace the point forecast differences.
+
+```{r helpers}
+variogram_score <- function(forecast, observed, p = 0.5) {
+  n <- length(observed)
+  score <- 0
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      f_diff <- abs(forecast[i] - forecast[j])^p
+      y_diff <- abs(observed[i] - observed[j])^p
+      score <- score + (f_diff - y_diff)^2
+    }
+  }
+  score
+}
+
+mae <- function(forecast, observed) mean(abs(forecast - observed))
+
+pairwise_diff_matrix <- function(x) {
+  n <- length(x)
+  m <- matrix(NA, n, n)
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      m[i, j] <- abs(x[i] - x[j])
+    }
+  }
+  m
+}
+
+mat_to_df <- function(m, label) {
+  n <- nrow(m)
+  data.frame(
+    row = rep(seq_len(n), each = n),
+    col = rep(seq_len(n), times = n),
+    value = as.vector(m),
+    source = label
+  )
+}
+```
+
+### Example 1: Constant bias vs close-but-misordered
+
+Model A has a constant additive bias of +3 but preserves all pairwise differences perfectly.
+Model B is much closer to the truth (MAE = 0.41 vs 3.0) but swaps the rankings of locations 4/5 and 8/9.
+
+```{r example1-data}
+true_values <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+model_a <- true_values + 3
+model_b <- c(1.2, 2.3, 3.1, 4.8, 4.2, 5.8, 7.2, 8.5, 8.3, 9.7)
+
+data.frame(
+  Metric = c("MAE", "Rank correlation", "Variogram Score (p=1)"),
+  `Model A` = c(
+    sprintf("%.2f", mae(model_a, true_values)),
+    sprintf("%.3f", cor(model_a, true_values, method = "spearman")),
+    sprintf("%.2f", variogram_score(model_a, true_values, p = 1))
+  ),
+  `Model B` = c(
+    sprintf("%.2f", mae(model_b, true_values)),
+    sprintf("%.3f", cor(model_b, true_values, method = "spearman")),
+    sprintf("%.2f", variogram_score(model_b, true_values, p = 1))
+  ),
+  check.names = FALSE
+) |> knitr::kable(align = "lrr")
+```
+
+Model A achieves a **perfect** variogram score of 0 despite being far worse on MAE.
+The +3 constant cancels in every pairwise difference.
+
+```{r example1-bars, fig.height=4}
+loc_labels <- paste0("Loc ", seq_along(true_values))
+
+df1 <- data.frame(
+  location = rep(factor(loc_labels, levels = loc_labels), 3),
+  value = c(true_values, model_a, model_b),
+  model = rep(c("Truth", "Model A (biased, correct ranking)",
+                "Model B (close, wrong ranking)"), each = 10)
+)
+df1$model <- factor(df1$model, levels = c(
+  "Truth", "Model A (biased, correct ranking)",
+  "Model B (close, wrong ranking)"
+))
+
+ggplot(df1, aes(x = location, y = value, fill = model)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = c("Truth" = "grey30",
+                                "Model A (biased, correct ranking)" = "#2166AC",
+                                "Model B (close, wrong ranking)" = "#B2182B")) +
+  labs(title = "Example 1: Constant bias vs close-but-misordered",
+       subtitle = sprintf(
+         "Model A: MAE=%.1f, VS=%.2f  |  Model B: MAE=%.2f, VS=%.2f",
+         mae(model_a, true_values),
+         variogram_score(model_a, true_values, p = 1),
+         mae(model_b, true_values),
+         variogram_score(model_b, true_values, p = 1)),
+       x = NULL, y = "Incidence", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The heatmaps below show the squared error in each pairwise difference --- the quantity that sums to the variogram score. Model A's matrix is entirely zero. Model B's errors concentrate around the swapped location pairs (4/5 and 8/9).
+
+```{r example1-heatmap}
+dm_truth <- pairwise_diff_matrix(true_values)
+dm_a     <- pairwise_diff_matrix(model_a)
+dm_b     <- pairwise_diff_matrix(model_b)
+err_a    <- (dm_a - dm_truth)^2
+err_b    <- (dm_b - dm_truth)^2
+
+df_err <- rbind(mat_to_df(err_a, "Model A"), mat_to_df(err_b, "Model B"))
+df_err$source <- factor(df_err$source, levels = c("Model A", "Model B"))
+
+ggplot(df_err, aes(x = col, y = row, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "#B2182B",
+                      name = expression((Delta*f - Delta*y)^2)) +
+  scale_y_reverse() +
+  facet_wrap(~source) +
+  coord_equal() +
+  labs(title = "Pairwise difference errors (p=1)",
+       subtitle = "Each cell: (|f_i - f_j| - |y_i - y_j|)^2. Sum of upper triangle = variogram score.",
+       x = "Location", y = "Location") +
+  theme_minimal(base_size = 11)
+```
+
+### Example 2: Misidentified hotspot
+
+Here Model A correctly identifies the spatial pattern (Location 6 is the hotspot) but is scaled up by 1.5x. Model B is closer in absolute terms but underestimates the hotspot.
+
+```{r example2-data}
+true_values_2 <- c(1, 3, 5, 7, 4, 12)
+model_a2 <- true_values_2 * 1.5
+model_b2 <- c(3, 4, 5, 6, 4, 8)
+
+data.frame(
+  Metric = c("MAE", "Rank correlation", "Variogram Score (p=1)"),
+  `Model A` = c(
+    sprintf("%.2f", mae(model_a2, true_values_2)),
+    sprintf("%.3f", cor(model_a2, true_values_2, method = "spearman")),
+    sprintf("%.2f", variogram_score(model_a2, true_values_2, p = 1))
+  ),
+  `Model B` = c(
+    sprintf("%.2f", mae(model_b2, true_values_2)),
+    sprintf("%.3f", cor(model_b2, true_values_2, method = "spearman")),
+    sprintf("%.2f", variogram_score(model_b2, true_values_2, p = 1))
+  ),
+  check.names = FALSE
+) |> knitr::kable(align = "lrr")
+```
+
+Model A wins on variogram score (110 vs 128) despite worse MAE. But note that **Model A's VS is not zero** --- unlike Example 1, multiplicative bias *does* change pairwise differences.
+
+```{r example2-bars, fig.height=4}
+loc_labels_2 <- paste0("Loc ", seq_along(true_values_2))
+
+df2 <- data.frame(
+  location = rep(factor(loc_labels_2, levels = loc_labels_2), 3),
+  value = c(true_values_2, model_a2, model_b2),
+  model = rep(c("Truth", "Model A (scaled x1.5, correct pattern)",
+                "Model B (closer, wrong hotspot)"), each = 6)
+)
+df2$model <- factor(df2$model, levels = c(
+  "Truth", "Model A (scaled x1.5, correct pattern)",
+  "Model B (closer, wrong hotspot)"
+))
+
+ggplot(df2, aes(x = location, y = value, fill = model)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = c("Truth" = "grey30",
+                                "Model A (scaled x1.5, correct pattern)" = "#2166AC",
+                                "Model B (closer, wrong hotspot)" = "#B2182B")) +
+  labs(title = "Example 2: Correct spatial pattern vs misidentified hotspot",
+       subtitle = sprintf(
+         "Model A: MAE=%.2f, VS=%.2f  |  Model B: MAE=%.2f, VS=%.2f",
+         mae(model_a2, true_values_2),
+         variogram_score(model_a2, true_values_2, p = 1),
+         mae(model_b2, true_values_2),
+         variogram_score(model_b2, true_values_2, p = 1)),
+       x = NULL, y = "Incidence", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+### Why additive bias gives VS=0 but multiplicative bias does not
+
+This is a subtle but important point.
+With **additive bias** $f_i = y_i + c$, every pairwise difference is unchanged:
+
+$$|f_i - f_j| = |(y_i + c) - (y_j + c)| = |y_i - y_j|$$
+
+With **multiplicative bias** $f_i = c \cdot y_i$, pairwise differences are scaled:
+
+$$|f_i - f_j| = c \cdot |y_i - y_j|$$
+
+The penalty per pair becomes $(c-1)^2 \cdot |y_i - y_j|^2$, which grows with the true gap size.
+Crucially, the multiplicative bias inflates all gaps **uniformly** --- it preserves the *pattern* of which pairs are large vs small.
+Model B, by contrast, *selectively compresses* the hotspot gaps, distorting the pattern itself.
+
+The matrices below make this visible. The additive +3 matrix is cell-for-cell identical to Truth.
+The multiplicative x1.5 matrix has the same pattern but darker everywhere. Model B has a different pattern entirely.
+
+```{r example2b-heatmaps, fig.height=9}
+dm_truth2 <- pairwise_diff_matrix(true_values_2)
+dm_a2     <- pairwise_diff_matrix(model_a2)
+dm_b2     <- pairwise_diff_matrix(model_b2)
+
+model_a2_additive <- true_values_2 + 3
+dm_a2_add <- pairwise_diff_matrix(model_a2_additive)
+
+df_diffs <- rbind(
+  mat_to_df(dm_truth2, "Truth"),
+  mat_to_df(dm_a2_add, "Additive +3 (VS=0)"),
+  mat_to_df(dm_a2, "Multiplicative x1.5 (VS=110)")
+)
+df_diffs$source <- factor(df_diffs$source, levels = c(
+  "Truth", "Additive +3 (VS=0)", "Multiplicative x1.5 (VS=110)"
+))
+
+p_top <- ggplot(df_diffs, aes(x = col, y = row, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 1)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#2166AC", name = "|f_i - f_j|") +
+  scale_y_reverse() +
+  facet_wrap(~source) +
+  coord_equal() +
+  labs(title = "Additive bias preserves differences; multiplicative bias scales them",
+       x = "Location", y = "Location") +
+  theme_minimal(base_size = 11)
+
+df_diffs_b <- rbind(
+  mat_to_df(dm_truth2, "Truth"),
+  mat_to_df(dm_a2, "Model A (x1.5)"),
+  mat_to_df(dm_b2, "Model B (wrong pattern)")
+)
+df_diffs_b$source <- factor(df_diffs_b$source, levels = c(
+  "Truth", "Model A (x1.5)", "Model B (wrong pattern)"
+))
+
+p_bottom <- ggplot(df_diffs_b, aes(x = col, y = row, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 1)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#2166AC", name = "|f_i - f_j|") +
+  scale_y_reverse() +
+  facet_wrap(~source) +
+  coord_equal() +
+  labs(title = "Multiplicative bias preserves the pattern; Model B distorts it",
+       x = "Location", y = "Location") +
+  theme_minimal(base_size = 11)
+
+p_top / p_bottom
+```
+
+### Example 3: Correct ranking but wrong gap magnitudes
+
+The variogram score is **stronger than a ranking metric**. Both models below rank all locations identically (Spearman correlation = 1.0), but Model A wrongly treats the gaps as uniform while Model B preserves the true gap structure.
+
+```{r example3-data}
+true_values_4 <- c(1, 2, 5, 6, 10)
+model_a4 <- c(2, 4, 6, 8, 10)
+model_b4 <- true_values_4 + 3
+
+data.frame(
+  Metric = c("MAE", "Rank correlation", "Variogram Score (p=1)"),
+  `Model A` = c(
+    sprintf("%.2f", mae(model_a4, true_values_4)),
+    sprintf("%.3f", cor(model_a4, true_values_4, method = "spearman")),
+    sprintf("%.2f", variogram_score(model_a4, true_values_4, p = 1))
+  ),
+  `Model B` = c(
+    sprintf("%.2f", mae(model_b4, true_values_4)),
+    sprintf("%.3f", cor(model_b4, true_values_4, method = "spearman")),
+    sprintf("%.2f", variogram_score(model_b4, true_values_4, p = 1))
+  ),
+  check.names = FALSE
+) |> knitr::kable(align = "lrr")
+```
+
+```{r example3-plot, fig.height=4}
+loc_labels_4 <- paste0("Loc ", seq_along(true_values_4))
+
+df4 <- data.frame(
+  location = rep(factor(loc_labels_4, levels = loc_labels_4), 3),
+  value = c(true_values_4, model_a4, model_b4),
+  model = rep(c("Truth", "Model A (correct ranking, wrong gaps)",
+                "Model B (correct gaps, biased +3)"), each = 5)
+)
+df4$model <- factor(df4$model, levels = c(
+  "Truth", "Model A (correct ranking, wrong gaps)",
+  "Model B (correct gaps, biased +3)"
+))
+
+ggplot(df4, aes(x = location, y = value, fill = model)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = c("Truth" = "grey30",
+                                "Model A (correct ranking, wrong gaps)" = "#2166AC",
+                                "Model B (correct gaps, biased +3)" = "#B2182B")) +
+  labs(title = "Example 3: Both rank correctly, but gaps differ",
+       subtitle = sprintf(
+         "Model A: MAE=%.2f, VS=%.2f  |  Model B: MAE=%.2f, VS=%.2f",
+         mae(model_a4, true_values_4),
+         variogram_score(model_a4, true_values_4, p = 1),
+         mae(model_b4, true_values_4),
+         variogram_score(model_b4, true_values_4, p = 1)),
+       x = NULL, y = "Incidence", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+Model B wins (VS = 0) despite worse MAE (3.0 vs 1.2).
+The variogram score captures that Model A incorrectly uniformizes the spacing: the truth has a cluster at Locations 1--2, a jump to 3--4, and another jump to 5.
+Model A misses this structure.
+For allocation decisions, knowing that Location 5 needs much more than Location 4 (not just slightly more) is critical.
+
+## Summary
+
+The variogram score evaluates whether a forecast correctly captures the **pairwise difference structure** across locations.
+It is:
+
+- **Invariant to additive bias** --- a constant shift affects all locations equally and is invisible to the score.
+- **Sensitive to distorted relative magnitudes** --- if the forecast compresses or expands the gaps between specific locations, or swaps their rankings, the score detects this.
+- **Stronger than ordinal ranking** --- it distinguishes forecasts that rank locations identically but differ in gap magnitudes.
+- **Available in standard software** --- `scoringRules::vs_sample()` in R, `scoringrules.variogram_score()` in Python.
+
+This makes it a natural complement to WIS/CRPS for evaluating multi-location epidemic forecasts, particularly when downstream decisions (like resource allocation) depend on the relative distribution of burden across locations.
+The variogram score and the allocation score (Gerding et al., 2024) target overlapping aspects of forecast quality, but no published work has formally compared them.
+
+## References
+
+- Allen, S., Ziegel, J., & Ginsbourger, D. (2025). Proper scoring rules for multivariate probabilistic forecasts based on aggregation and transformation. *Advances in Statistical Climatology, Meteorology and Oceanography*, 11, 23--58. [Link](https://ascmo.copernicus.org/articles/11/23/2025/)
+- Bosse, N. I., Gruson, H., Cori, A., van Leeuwen, E., Funk, S., & Abbott, S. (2023). Scoring epidemiological forecasts on transformed scales. *PLOS Computational Biology*, 19(8), e1011393. [Link](https://pmc.ncbi.nlm.nih.gov/articles/PMC10495027/)
+- Bracher, J., Ray, E. L., Gneiting, T., & Reich, N. G. (2021). Evaluating epidemic forecasts in an interval format. *PLOS Computational Biology*, 17(2), e1008618. [Link](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1008618)
+- Gerding, A., Cramer, E. Y., Ray, E. L., Bracher, J., & Reich, N. G. (2024). Evaluating infectious disease forecasts with allocation scoring rules. *Journal of the Royal Statistical Society Series A*, 188(4), 1299--1320. [Link](https://academic.oup.com/jrsssa/article/188/4/1299/7927906)
+- Scheuerer, M., & Hamill, T. M. (2015). Variogram-based proper scoring rules for probabilistic forecasts of multivariate quantities. *Monthly Weather Review*, 143(4), 1321--1334. [Link](https://journals.ametsoc.org/view/journals/mwre/143/4/mwr-d-14-00269.1.xml)
