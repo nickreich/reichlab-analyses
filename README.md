@@ -14,6 +14,11 @@ reichlab-analyses/
     ...
 ```
 
+## Formats
+
+- **Scripts** (`.R`, `.py`) are the default for straightforward analyses.
+- **Notebooks** (`.qmd`, `.Rmd`, `.ipynb`) are encouraged for more complex analyses where narrative context, step-by-step explanation, and inline results help tell the story. Notebooks are especially useful when an analysis builds up intuition incrementally or compares multiple approaches.
+
 ## Conventions
 
 - **One directory per analysis.** Scripts and their outputs live together.

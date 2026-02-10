@@ -38,6 +38,13 @@ This repository contains small, self-contained analyses. Follow these rules when
 3. Run the script from the repo root to verify it works.
 4. Add a row to the table in README.md describing the new analysis.
 
+## Formats
+
+- **Scripts** (`.R`, `.py`) are the default for straightforward analyses.
+- **Notebooks** (`.qmd`, `.Rmd`, `.ipynb`) are encouraged for more complex analyses where narrative context helps tell the story. Use notebooks when an analysis builds up intuition incrementally, compares multiple approaches, or benefits from inline prose explaining the "why" alongside the code and results.
+- When creating a notebook, it should still be fully reproducible (render/run start-to-finish without manual intervention).
+- Rendered notebook output (`.html`) may be committed alongside the source if useful for sharing, but is not required.
+
 ## Languages
 
 - R and Python are both fine. Use whichever is more natural for the analysis.
