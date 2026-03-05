@@ -1,0 +1,962 @@
+---
+title: "MAE vs Variogram Score on FluSight Forecasts"
+subtitle: "Comparing location-independent and cross-location scoring of 2025-26 flu season median forecasts"
+author: "Claude (Anthropic)"
+date: "2026-03-04"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 10, fig.height = 7
+)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+## Overview
+
+This analysis compares two ways of scoring FluSight median point forecasts for
+the 2025-26 flu season:
+
+- **MAE** (mean absolute error): scores each location independently, then
+  averages. A model can have low MAE by being close in absolute terms at each
+  location, even if it gets the relative pattern across locations wrong.
+- **Variogram score**: evaluates whether a model captures the correct pairwise
+  difference structure across locations. A model with perfect relative ordering
+  and spacing gets a low variogram score even if it has a constant additive
+  bias.
+
+The goal is to see whether these two metrics agree on which models are "best",
+and where they diverge.
+
+**Requirements**: Dev versions of scoringutils (>= 2.1.2.9000) and hubEvals
+(>= 0.1.0.9000) from GitHub. See the setup chunk below.
+
+```{r install-dev-packages, eval=FALSE}
+# Run once to install dev versions:
+# remotes::install_github("epiforecasts/scoringutils")
+# remotes::install_github("hubverse-org/hubEvals")
+```
+
+```{r libraries}
+library(arrow)
+library(hubData)
+library(hubEvals)
+library(scoringutils)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(DT)
+```
+
+## Load Forecasts from the Cloud
+
+We connect to the FluSight hub's public S3 bucket, filter to the
+`wk inc flu hosp` target with quantile output type for the 2025-26 season
+(reference dates from 2025-11-22 through 2026-02-28), and keep horizons 0-3.
+
+```{r load-forecasts}
+hub_path <- s3_bucket("cdcepi-flusight-forecast-hub", anonymous = TRUE)
+
+hub_con <- connect_hub(hub_path, file_format = "parquet", skip_checks = TRUE)
+
+forecasts <- hub_con |>
+  filter(
+    target == "wk inc flu hosp",
+    output_type == "quantile",
+    horizon >= 0,
+    reference_date >= "2025-11-22",
+    reference_date <= "2026-02-28"
+  ) |>
+  collect_hub()
+
+cat("Rows loaded:", nrow(forecasts), "\n")
+cat("Models:", length(unique(forecasts$model_id)), "\n")
+cat("Reference dates:", length(unique(forecasts$reference_date)), "\n")
+```
+
+### Select models with near-complete submissions
+
+We count how many (reference_date, horizon, location) combos each model
+submitted for, and keep models with >= 90% completeness.
+
+```{r select-models}
+ref_dates <- sort(unique(forecasts$reference_date))
+horizons <- 0:3
+locations <- sort(unique(forecasts$location))
+
+# Count using just median forecasts (output_type_id == 0.5)
+completeness <- forecasts |>
+  filter(as.numeric(output_type_id) == 0.5) |>
+  group_by(model_id) |>
+  summarise(
+    n_forecasts = n(),
+    n_ref_dates = n_distinct(reference_date),
+    .groups = "drop"
+  )
+
+n_possible <- length(ref_dates) * length(horizons) * length(locations)
+completeness <- completeness |>
+  mutate(pct_complete = n_forecasts / n_possible * 100) |>
+  arrange(desc(pct_complete))
+
+selected_models <- completeness |>
+  filter(pct_complete >= 90) |>
+  pull(model_id)
+
+cat("Models with >= 90% completeness:", length(selected_models), "\n")
+
+completeness |>
+  filter(model_id %in% selected_models) |>
+  mutate(pct_complete = round(pct_complete, 1)) |>
+  datatable(
+    colnames = c("Model", "Median forecasts", "Ref dates", "% complete"),
+    options = list(pageLength = 15, order = list(list(3, "desc")))
+  )
+```
+
+```{r filter-to-selected}
+forecasts <- forecasts |>
+  filter(model_id %in% selected_models)
+```
+
+## Compute MAE with hubEvals
+
+We use `hubEvals::score_model_out()` with `metrics = "ae_median"` on the
+quantile forecasts. This handles truth-joining internally via the oracle output.
+
+```{r load-oracle}
+oracle <- connect_target_oracle_output(hub_path) |>
+  filter(target == "wk inc flu hosp") |>
+  collect() |>
+  select(-as_of)
+
+cat("Oracle rows for wk inc flu hosp:", nrow(oracle), "\n")
+```
+
+```{r compute-mae}
+mae_scores <- score_model_out(
+  forecasts,
+  oracle,
+  metrics = "ae_median",
+  summarize = FALSE
+)
+
+cat("MAE score rows:", nrow(mae_scores), "\n")
+```
+
+### Aggregate MAE
+
+```{r mae-by-model}
+mae_by_model <- mae_scores |>
+  group_by(model_id) |>
+  summarise(mae = mean(ae_median, na.rm = TRUE), .groups = "drop") |>
+  arrange(mae)
+
+mae_by_model |>
+  mutate(mae = round(mae, 2)) |>
+  datatable(
+    colnames = c("Model", "Mean MAE"),
+    options = list(pageLength = 15, order = list(list(1, "asc")))
+  )
+```
+
+```{r mae-by-model-horizon}
+mae_by_model_horizon <- mae_scores |>
+  group_by(model_id, horizon) |>
+  summarise(mae = mean(ae_median, na.rm = TRUE), .groups = "drop")
+```
+
+## Compute Variogram Score
+
+The variogram score evaluates whether a model captures the correct pairwise
+difference structure across locations. We use
+`hubEvals::transform_quantile_model_out()` to join truth via the oracle output,
+then extract median forecasts and pass them to
+`scoringutils::as_forecast_multivariate_point()` with
+`joint_across = "location"`. We exclude "US" (not independent of states).
+
+### Prepare data via hubEvals
+
+```{r prepare-vs-data}
+# Use hubEvals to join truth to forecasts via oracle output
+forecast_quantile <- transform_quantile_model_out(forecasts, oracle)
+
+# Extract median rows (quantile_level == 0.5) and reshape for multivariate scoring
+vs_data <- forecast_quantile |>
+  as.data.frame() |>
+  filter(quantile_level == 0.5, location != "US") |>
+  select(model = model, reference_date, horizon, target_end_date,
+         location, observed, predicted) |>
+  rename(model_id = model) |>
+  filter(!is.na(observed)) |>
+  mutate(
+    target_end_date = as.character(target_end_date),
+    reference_date = as.character(reference_date)
+  )
+
+cat("VS data rows after truth join and filtering:", nrow(vs_data), "\n")
+```
+
+### Filter to complete snapshots
+
+The variogram score requires all locations present for each
+(model_id, reference_date, horizon) group.
+
+```{r complete-snapshots}
+n_locations <- n_distinct(vs_data$location)
+cat("Expected locations per snapshot (excluding US):", n_locations, "\n")
+
+snapshot_counts <- vs_data |>
+  group_by(model_id, reference_date, horizon) |>
+  summarise(n_loc = n_distinct(location), .groups = "drop")
+
+incomplete <- snapshot_counts |> filter(n_loc < n_locations)
+cat("Incomplete snapshots (will be dropped):", nrow(incomplete), "\n")
+
+vs_data <- vs_data |>
+  semi_join(
+    snapshot_counts |> filter(n_loc == n_locations),
+    by = c("model_id", "reference_date", "horizon")
+  )
+
+vs_data <- vs_data |> arrange(model_id, reference_date, horizon, location)
+cat("VS data rows after filtering to complete snapshots:", nrow(vs_data), "\n")
+```
+
+### Score with scoringutils
+
+```{r compute-vs}
+vs_forecast <- as_forecast_multivariate_point(
+  vs_data,
+  forecast_unit = c("model_id", "reference_date", "horizon", "location"),
+  joint_across = "location",
+  observed = "observed",
+  predicted = "predicted"
+)
+
+vs_scores <- score(vs_forecast)
+cat("VS score rows:", nrow(vs_scores), "\n")
+```
+
+### Aggregate variogram scores
+
+```{r vs-by-model}
+vs_by_model <- vs_scores |>
+  group_by(model_id) |>
+  summarise(vs = mean(variogram_score, na.rm = TRUE), .groups = "drop") |>
+  arrange(vs)
+
+vs_by_model |>
+  mutate(vs = round(vs, 1)) |>
+  datatable(
+    colnames = c("Model", "Mean VS"),
+    options = list(pageLength = 15, order = list(list(1, "asc")))
+  )
+```
+
+```{r vs-by-model-horizon}
+vs_by_model_horizon <- vs_scores |>
+  group_by(model_id, horizon) |>
+  summarise(vs = mean(variogram_score, na.rm = TRUE), .groups = "drop")
+```
+
+## Compare MAE vs Variogram Score
+
+### Combined rankings
+
+```{r combined-table}
+combined <- mae_by_model |>
+  inner_join(vs_by_model, by = "model_id") |>
+  inner_join(
+    completeness |> select(model_id, pct_complete),
+    by = "model_id"
+  ) |>
+  mutate(
+    mae_rank = rank(mae),
+    vs_rank = rank(vs)
+  ) |>
+  arrange(mae_rank)
+
+rho <- cor(combined$mae_rank, combined$vs_rank, method = "spearman")
+
+combined |>
+  mutate(
+    mae = round(mae, 2),
+    vs = round(vs, 1),
+    mae_rank = as.integer(mae_rank),
+    vs_rank = as.integer(vs_rank),
+    pct_complete = round(pct_complete, 1)
+  ) |>
+  datatable(
+    colnames = c("Model", "MAE", "VS", "% complete", "MAE rank", "VS rank"),
+    caption = sprintf("Spearman rank correlation: %.3f", rho),
+    options = list(pageLength = 35, order = list(list(4, "asc")))
+  )
+```
+
+### Plot 1: MAE by model, faceted by horizon
+
+```{r plot-mae-horizon, fig.height=8}
+model_order_mae <- mae_by_model |> arrange(mae) |> pull(model_id)
+
+p_mae <- mae_by_model_horizon |>
+  mutate(model_id = factor(model_id, levels = model_order_mae)) |>
+  ggplot(aes(x = mae, y = model_id)) +
+  geom_point(size = 2, color = "#2166AC") +
+  facet_wrap(~paste("Horizon", horizon), scales = "free_x", nrow = 1) +
+  labs(title = "MAE by model and horizon",
+       x = "Mean Absolute Error", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+
+p_mae
+```
+
+### Plot 2: Variogram score by model, faceted by horizon
+
+```{r plot-vs-horizon, fig.height=8}
+model_order_vs <- vs_by_model |> arrange(vs) |> pull(model_id)
+
+p_vs <- vs_by_model_horizon |>
+  mutate(model_id = factor(model_id, levels = model_order_vs)) |>
+  ggplot(aes(x = vs, y = model_id)) +
+  geom_point(size = 2, color = "#B2182B") +
+  facet_wrap(~paste("Horizon", horizon), scales = "free_x", nrow = 1) +
+  labs(title = "Variogram score by model and horizon",
+       x = "Variogram Score", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+
+p_vs
+```
+
+### Plot 3: MAE vs variogram score scatter (key plot)
+
+```{r plot-scatter, fig.height=7, fig.width=8}
+p_scatter <- combined |>
+  ggplot(aes(x = mae, y = vs, label = model_id)) +
+  geom_point(size = 3, color = "#4393C3") +
+  geom_text_repel(size = 3, max.overlaps = 20, seed = 42) +
+  labs(
+    title = "MAE vs Variogram Score (overall means)",
+    subtitle = sprintf("Spearman rank correlation: %.3f", rho),
+    x = "Mean Absolute Error (lower = better)",
+    y = "Variogram Score (lower = better)"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_scatter
+ggsave("variogram-flusight-analysis/plots/mae_vs_vs_scatter.png",
+       p_scatter, width = 9, height = 7, dpi = 150)
+```
+
+### Plot 4: Rank comparison
+
+```{r plot-ranks, fig.height=7, fig.width=7}
+p_ranks <- combined |>
+  ggplot(aes(x = mae_rank, y = vs_rank, label = model_id)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3, color = "#4393C3") +
+  geom_text_repel(size = 3, max.overlaps = 20, seed = 42) +
+  labs(
+    title = "Rank comparison: MAE rank vs Variogram Score rank",
+    subtitle = "Points on diagonal = same rank under both metrics",
+    x = "MAE rank (1 = best)",
+    y = "Variogram Score rank (1 = best)"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 12)
+
+p_ranks
+ggsave("variogram-flusight-analysis/plots/rank_comparison.png",
+       p_ranks, width = 7, height = 7, dpi = 150)
+```
+
+### Plot 5: Variogram score over time (horizon 1)
+
+```{r plot-vs-time, fig.height=6, fig.width=10}
+highlight_models <- unique(c(
+  head(model_order_vs, 3),
+  tail(model_order_vs, 2),
+  head(model_order_mae, 2)
+))
+
+vs_time <- vs_scores |>
+  filter(horizon == 1) |>
+  mutate(reference_date = as.Date(reference_date))
+
+p_time <- vs_time |>
+  ggplot(aes(x = reference_date, y = variogram_score,
+             group = model_id)) +
+  geom_line(data = vs_time |> filter(!model_id %in% highlight_models),
+            alpha = 0.15, color = "grey50") +
+  geom_line(data = vs_time |> filter(model_id %in% highlight_models),
+            aes(color = model_id), linewidth = 0.8) +
+  labs(
+    title = "Variogram score over the season (horizon 1)",
+    x = "Reference date",
+    y = "Variogram Score",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+p_time
+ggsave("variogram-flusight-analysis/plots/vs_over_time_h1.png",
+       p_time, width = 10, height = 6, dpi = 150)
+```
+
+## Case Studies: Why MAE and VS Disagree
+
+To find clear examples of MAE/VS disagreement, we first identify a single
+reference date where the spread of both scores across models is large. We then
+pick model pairs based on their rankings **on that specific date**, so the
+snapshot plots directly reflect the chosen contrast.
+
+```{r find-focus-date}
+# Compute per-model, per-date scores at horizon 1
+mae_h1 <- mae_scores |>
+  filter(horizon == 1) |>
+  group_by(model_id, reference_date) |>
+  summarise(mae = mean(ae_median, na.rm = TRUE), .groups = "drop")
+
+vs_h1 <- vs_scores |>
+  filter(horizon == 1) |>
+  mutate(reference_date = as.Date(reference_date))
+
+# For each date, compute IQR of MAE and VS across models, then normalise
+date_spread <- mae_h1 |>
+  group_by(reference_date) |>
+  summarise(mae_iqr = IQR(mae), .groups = "drop") |>
+  inner_join(
+    vs_h1 |>
+      group_by(reference_date) |>
+      summarise(vs_iqr = IQR(variogram_score), .groups = "drop"),
+    by = "reference_date"
+  ) |>
+  mutate(
+    mae_iqr_norm = mae_iqr / max(mae_iqr),
+    vs_iqr_norm = vs_iqr / max(vs_iqr),
+    combined_spread = mae_iqr_norm + vs_iqr_norm
+  ) |>
+  arrange(desc(combined_spread))
+
+focus_date <- date_spread$reference_date[1]
+cat("Focus date (largest combined MAE + VS spread at horizon 1):", as.character(focus_date), "\n")
+```
+
+```{r pick-case-models}
+# Rank models on the focus date
+mae_focus <- mae_h1 |>
+  filter(reference_date == focus_date) |>
+  mutate(mae_rank = rank(mae))
+
+vs_focus <- vs_h1 |>
+  filter(reference_date == focus_date) |>
+  mutate(vs_rank = rank(variogram_score))
+
+focus_ranks <- mae_focus |>
+  select(model_id, mae, mae_rank) |>
+  inner_join(
+    vs_focus |> select(model_id, vs = variogram_score, vs_rank),
+    by = "model_id"
+  )
+
+# Pick model pairs from the focus-date rankings
+# Good at both: lowest sum of ranks
+focus_ranks <- focus_ranks |>
+  mutate(rank_sum = mae_rank + vs_rank,
+         rank_diff = mae_rank - vs_rank)
+
+good_both <- focus_ranks |>
+  arrange(rank_sum) |>
+  head(2) |>
+  pull(model_id)
+
+# Good MAE / bad VS: most negative rank_diff (low MAE rank, high VS rank)
+good_mae_bad_vs <- focus_ranks |>
+  arrange(rank_diff) |>
+  head(2) |>
+  pull(model_id)
+
+# Good VS / bad MAE: most positive rank_diff (high MAE rank, low VS rank)
+good_vs_bad_mae <- focus_ranks |>
+  arrange(desc(rank_diff)) |>
+  head(2) |>
+  pull(model_id)
+
+case_models <- c(good_both, good_mae_bad_vs, good_vs_bad_mae)
+
+# Label each model with its group for faceting
+case_labels <- tibble(
+  model_id = case_models,
+  group = factor(
+    rep(c("Good both", "Good MAE / Bad VS", "Good VS / Bad MAE"), each = 2),
+    levels = c("Good both", "Good MAE / Bad VS", "Good VS / Bad MAE")
+  )
+)
+
+focus_ranks |>
+  filter(model_id %in% case_models) |>
+  inner_join(case_labels, by = "model_id") |>
+  mutate(
+    mae = round(mae, 1), vs = round(vs, 0),
+    mae_rank = as.integer(mae_rank), vs_rank = as.integer(vs_rank)
+  ) |>
+  arrange(group) |>
+  select(group, model_id, mae, mae_rank, vs, vs_rank) |>
+  knitr::kable(col.names = c("Group", "Model", "MAE", "MAE rank", "VS",
+                               "VS rank"),
+               caption = sprintf("Model pairs selected from %s (horizon 1)", focus_date))
+```
+
+```{r load-locations}
+# Load location abbreviations from S3 (no hubData helper for auxiliary data)
+s3 <- S3FileSystem$create(anonymous = TRUE)
+loc_lookup <- read_csv_arrow(
+  s3$OpenInputStream(
+    "cdcepi-flusight-forecast-hub/auxiliary-data/locations.csv"
+  )
+) |>
+  as.data.frame() |>
+  select(location, abbreviation)
+```
+
+### Decomposing the variogram score
+
+The variogram score (order $p = 0.5$) is defined as:
+
+$$\text{VS} = \sum_{i < j} \left( |y_i - y_j|^{0.5} - |\widehat{y}_i - \widehat{y}_j|^{0.5} \right)^2$$
+
+where $y_i$ and $\widehat{y}_i$ are the observed and predicted values at location
+$i$. The score sums over all $\binom{52}{2} = 1326$ location pairs. Each term
+measures how well the model captures the *difference* between two locations.
+
+To see what drives VS, write $\widehat{y}_i = y_i + e_i$ where $e_i$ is the
+forecast error at location $i$. The predicted pairwise difference becomes
+$\widehat{y}_i - \widehat{y}_j = (y_i - y_j) + (e_i - e_j)$. So each VS term depends
+on the **error differential** $e_i - e_j$, not the errors themselves:
+
+- If all errors are equal ($e_i = e_j$ for all pairs), the error differentials
+  are zero and VS is perfect --- even with large constant bias.
+- If one location has a very different error from the rest, all pairs involving
+  it have large error differentials, inflating VS.
+
+In other words, VS measures **error heterogeneity** across locations. A model
+with uniformly large errors (bad MAE) can still get a good VS because the
+pairwise differentials are small. A model with mostly small errors but one
+outlier location (decent MAE) can get a bad VS because that one outlier creates
+51 pairs with large differentials.
+
+We can decompose each model's total VS into **per-location contributions** by
+summing all pairwise terms that involve each location (each term is counted
+twice, once per participating location). Locations whose error $e_i$ diverges
+most from the other locations' errors will dominate the sum.
+
+```{r vs-decomposition, fig.height=9, fig.width=10}
+# Compute pairwise VS terms for a single snapshot (one model, one date)
+compute_loc_contributions <- function(df) {
+  n <- nrow(df)
+  pairs <- expand.grid(i = 1:n, j = 1:n) |> filter(i < j)
+  obs_diff <- abs(df$observed[pairs$i] - df$observed[pairs$j])^0.5
+  pred_diff <- abs(df$predicted[pairs$i] - df$predicted[pairs$j])^0.5
+  term <- (obs_diff - pred_diff)^2
+
+  # Attribute each term to both participating locations
+  pair_data <- data.frame(
+    location = c(df$location[pairs$i], df$location[pairs$j]),
+    vs_term = rep(term, 2)
+  )
+  pair_data |>
+    group_by(location) |>
+    summarise(vs_contribution = sum(vs_term), .groups = "drop")
+}
+
+# Compute for all case models on focus date, horizon 1
+focus_snap <- vs_data |>
+  filter(model_id %in% case_models,
+         reference_date == as.character(focus_date), horizon == 1)
+
+loc_vs <- focus_snap |>
+  group_by(model_id) |>
+  group_modify(~ compute_loc_contributions(.x)) |>
+  ungroup() |>
+  inner_join(case_labels, by = "model_id") |>
+  group_by(model_id) |>
+  mutate(
+    pct_of_total = vs_contribution / sum(vs_contribution) * 100,
+    loc_rank = rank(-vs_contribution)
+  ) |>
+  ungroup()
+
+# Show cumulative contribution curves (Lorenz-like)
+cum_curves <- loc_vs |>
+  arrange(model_id, desc(vs_contribution)) |>
+  group_by(model_id, group) |>
+  mutate(
+    cum_pct = cumsum(vs_contribution) / sum(vs_contribution) * 100,
+    loc_index = row_number()
+  ) |>
+  ungroup() |>
+  mutate(
+    facet = factor(
+      paste0(group, ": ", model_id),
+      levels = loc_vs |>
+        distinct(group, model_id) |>
+        arrange(group, model_id) |>
+        mutate(f = paste0(group, ": ", model_id)) |>
+        pull(f)
+    )
+  )
+
+p_cum <- cum_curves |>
+  ggplot(aes(x = loc_index, y = cum_pct, color = group)) +
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = 50, linetype = "dotted", color = "grey50") +
+  facet_wrap(~facet, ncol = 2) +
+  scale_color_manual(values = c(
+    "Good both" = "#2166AC",
+    "Good MAE / Bad VS" = "#B2182B",
+    "Good VS / Bad MAE" = "#1B7837"
+  )) +
+  labs(
+    title = sprintf("Cumulative VS contribution by location rank (%s, horizon 1)", focus_date),
+    subtitle = "Steeper curves = VS dominated by a few outlier locations; flatter = error differentials spread evenly",
+    x = "Location rank (by VS contribution, highest first)",
+    y = "Cumulative % of total VS"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold"))
+
+p_cum
+ggsave("variogram-flusight-analysis/plots/vs_cumulative_contribution.png",
+       p_cum, width = 10, height = 9, dpi = 150)
+```
+
+```{r vs-concentration-table}
+# Summary: how concentrated is each model's VS?
+concentration <- loc_vs |>
+  group_by(model_id, group) |>
+  summarise(
+    total_vs = sum(vs_contribution) / 2,  # divide by 2 since each term counted twice
+    top1_pct = max(pct_of_total),
+    top5_pct = sum(sort(pct_of_total, decreasing = TRUE)[1:5]),
+    .groups = "drop"
+  ) |>
+  arrange(group)
+
+# Get the top location for each model
+top_locs <- loc_vs |>
+  group_by(model_id) |>
+  slice_max(vs_contribution, n = 1) |>
+  left_join(loc_lookup, by = "location") |>
+  select(model_id, top_location = abbreviation, top_loc_pct = pct_of_total)
+
+concentration |>
+  left_join(top_locs, by = "model_id") |>
+  mutate(
+    total_vs = round(total_vs, 0),
+    top1_pct = round(top1_pct, 1),
+    top5_pct = round(top5_pct, 1),
+    top_loc_pct = round(top_loc_pct, 1)
+  ) |>
+  select(group, model_id, total_vs, top_location, top1_pct, top5_pct) |>
+  knitr::kable(
+    col.names = c("Group", "Model", "Total VS", "Top location",
+                  "Top-1 loc %", "Top-5 locs %"),
+    caption = "Concentration of VS contributions across locations"
+  )
+```
+
+The "good MAE / bad VS" models have VS contributions heavily concentrated in a
+few locations --- these are the locations whose errors differ most from the rest,
+creating large pairwise error differentials. In contrast, the "good VS / bad MAE"
+models have contributions spread more evenly: their errors are large everywhere
+(bad MAE), but roughly *uniform* across locations, so the pairwise differentials
+stay small (good VS).
+
+### Deep dive: UVAFluX-Ensemble's New York overshoot
+
+UVAFluX-Ensemble provides a concrete illustration. On the focus date, it
+dramatically overshoots New York ($e_{\text{NY}} \approx +5500$) while
+undershooting most other large states ($e_j < 0$). Because NY's error diverges
+so sharply from the rest, all 51 pairs involving NY have large error
+differentials $e_{\text{NY}} - e_j$, inflating the VS far beyond what the MAE
+would suggest.
+
+```{r uva-deep-dive, fig.height=5, fig.width=10}
+# Get the top contributing location for UVAFluX-Ensemble
+uva_top_loc <- loc_vs |>
+  filter(model_id == "UVAFluX-Ensemble") |>
+  slice_max(vs_contribution, n = 1) |>
+  pull(location)
+
+uva_snap <- focus_snap |>
+  filter(model_id == "UVAFluX-Ensemble") |>
+  left_join(loc_lookup, by = "location") |>
+  mutate(
+    error = predicted - observed,
+    is_outlier = location == uva_top_loc
+  )
+
+uva_top_abbr <- uva_snap$abbreviation[uva_snap$location == uva_top_loc]
+uva_top_obs <- uva_snap$observed[uva_snap$location == uva_top_loc]
+uva_top_pred <- uva_snap$predicted[uva_snap$location == uva_top_loc]
+uva_top_err <- uva_top_pred - uva_top_obs
+
+# Compare with a good-VS model on the same date
+good_model <- good_both[1]
+good_snap <- focus_snap |>
+  filter(model_id == good_model) |>
+  left_join(loc_lookup, by = "location") |>
+  mutate(error = predicted - observed)
+
+# Get dynamic ranks for panel labels
+uva_ranks <- focus_ranks |> filter(model_id == "UVAFluX-Ensemble")
+good_ranks <- focus_ranks |> filter(model_id == good_model)
+
+# Side-by-side: error by location for UVA vs the good model
+compare_data <- bind_rows(
+  uva_snap |> mutate(panel = sprintf("UVAFluX-Ensemble (VS rank %d, MAE rank %d)",
+                                      as.integer(uva_ranks$vs_rank),
+                                      as.integer(uva_ranks$mae_rank))),
+  good_snap |> mutate(panel = sprintf("%s (VS rank %d, MAE rank %d)",
+                                       good_model,
+                                       as.integer(good_ranks$vs_rank),
+                                       as.integer(good_ranks$mae_rank)),
+                       is_outlier = FALSE)
+) |>
+  mutate(panel = factor(panel, levels = unique(panel)))
+
+p_compare <- compare_data |>
+  ggplot(aes(x = reorder(abbreviation, -abs(error)), y = error,
+             fill = is_outlier)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("FALSE" = "#4393C3", "TRUE" = "#B2182B")) +
+  facet_wrap(~panel, ncol = 1, scales = "free_y") +
+  labs(
+    title = sprintf("Forecast errors by location (%s, horizon 1)", focus_date),
+    subtitle = sprintf(
+      "UVA overshoots %s by %s (obs: %s, pred: %s) --- this one location drives %.0f%% of UVA's total VS",
+      uva_top_abbr, format(uva_top_err, big.mark = ","),
+      format(uva_top_obs, big.mark = ","), format(uva_top_pred, big.mark = ","),
+      loc_vs |> filter(model_id == "UVAFluX-Ensemble", location == uva_top_loc) |> pull(pct_of_total)
+    ),
+    x = "State (ordered by |error|)", y = "Error (predicted - observed)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 7),
+        strip.text = element_text(face = "bold"))
+
+p_compare
+ggsave("variogram-flusight-analysis/plots/uva_error_comparison.png",
+       p_compare, width = 10, height = 7, dpi = 150)
+```
+
+We can visualise the VS matrix directly. Each cell $(i, j)$ in the lower
+triangle shows the pairwise VS term
+$(|y_i - y_j|^{0.5} - |\widehat{y}_i - \widehat{y}_j|^{0.5})^2$.
+Locations are sorted by forecast error so that the outlier location appears at
+one edge. For UVA, the entire row/column corresponding to New York lights up;
+for the good model, no single row or column dominates.
+
+```{r vs-heatmap, fig.height=7, fig.width=14}
+# Compute the full symmetric pairwise VS matrix for one model
+compute_vs_matrix <- function(df) {
+  # df must have: abbreviation, observed, predicted — sorted by error
+  n <- nrow(df)
+  pairs <- expand.grid(i = 1:n, j = 1:n) |> filter(i != j)
+  obs_diff <- abs(df$observed[pairs$i] - df$observed[pairs$j])^0.5
+  pred_diff <- abs(df$predicted[pairs$i] - df$predicted[pairs$j])^0.5
+  term <- (obs_diff - pred_diff)^2
+  data.frame(
+    loc_i = df$abbreviation[pairs$i],
+    loc_j = df$abbreviation[pairs$j],
+    vs_term = term
+  )
+}
+
+# Build one heatmap using a shared location order
+make_heat_plot <- function(snap_df, model_label, loc_order) {
+  snap_df <- snap_df |> arrange(match(abbreviation, loc_order))
+  # Ensure abbreviation column exists and matches loc_order
+  snap_df <- snap_df |> filter(abbreviation %in% loc_order)
+  mat <- compute_vs_matrix(snap_df) |>
+    mutate(
+      loc_i = factor(loc_i, levels = loc_order),
+      loc_j = factor(loc_j, levels = loc_order)
+    )
+  total <- format(round(sum(mat$vs_term) / 2), big.mark = ",")
+  ggplot(mat, aes(x = loc_j, y = loc_i, fill = vs_term)) +
+    geom_tile() +
+    scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "VS term",
+                         trans = "sqrt", limits = shared_limits) +
+    scale_y_discrete(limits = rev(loc_order)) +
+    scale_x_discrete(position = "top") +
+    labs(title = sprintf("%s (total VS = %s)", model_label, total),
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x.top = element_text(angle = 90, hjust = 0, vjust = 0.5, size = 5),
+      axis.text.y = element_text(size = 5),
+      plot.title = element_text(face = "bold", size = 10)
+    ) +
+    coord_equal()
+}
+
+# Shared location order: UVA's per-location VS contribution (largest at top-left)
+uva_loc_contrib <- loc_vs |>
+  filter(model_id == "UVAFluX-Ensemble") |>
+  left_join(loc_lookup, by = "location") |>
+  arrange(desc(vs_contribution))
+shared_loc_order <- uva_loc_contrib$abbreviation
+
+# Compute shared colour limits across both models
+uva_ordered <- uva_snap |> arrange(match(abbreviation, shared_loc_order))
+good_ordered <- good_snap |> arrange(match(abbreviation, shared_loc_order))
+all_terms <- c(compute_vs_matrix(uva_ordered)$vs_term,
+               compute_vs_matrix(good_ordered)$vs_term)
+shared_limits <- c(0, max(all_terms))
+
+p_heat_uva <- make_heat_plot(uva_snap, "UVAFluX-Ensemble", shared_loc_order)
+p_heat_good <- make_heat_plot(good_snap, good_model, shared_loc_order)
+
+p_heat <- (p_heat_uva + theme(legend.position = "bottom")) |
+  (p_heat_good + theme(legend.position = "bottom")) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = sprintf("Pairwise VS term matrices (%s, horizon 1)", focus_date),
+    subtitle = "Locations sorted by UVA's per-location VS contribution (largest at top-left). Each cell = one term in the VS sum.",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 10)
+    )
+  )
+
+p_heat
+ggsave("variogram-flusight-analysis/plots/vs_pairwise_heatmap.png",
+       p_heat, width = 14, height = 7, dpi = 150)
+```
+
+The UVA heatmap makes the mechanism visually obvious: the top row and leftmost
+column (New York, the location with the largest error) are uniformly hot,
+because the large error differential $e_{\text{NY}} - e_j$ produces a large VS
+term for every partner location $j$. The good model's heatmap shows no such
+stripe --- its VS terms are smaller overall and distributed more evenly across
+the matrix.
+
+### Cross-location profiles on the focus date
+
+For the top 20 locations by observed value, we compare the predicted profile
+to observed. Models with good VS should track the *shape* of the observed
+profile, even if the level is off.
+
+```{r case-snapshot-profile, fig.height=12, fig.width=10}
+snapshot <- vs_data |>
+  filter(model_id %in% case_models, horizon == 1,
+         reference_date == as.character(focus_date)) |>
+  left_join(loc_lookup, by = "location") |>
+  inner_join(case_labels, by = "model_id")
+
+# Order facets by group then model
+facet_order <- snapshot |>
+  distinct(group, model_id) |>
+  arrange(group, model_id) |>
+  mutate(f = paste0(group, ": ", model_id)) |>
+  pull(f)
+
+# Top 20 locations by observed value (from truth for this week)
+top_locs <- snapshot |>
+  filter(model_id == case_models[1]) |>
+  arrange(desc(observed)) |>
+  head(20) |>
+  pull(abbreviation)
+
+snapshot_top <- snapshot |>
+  filter(abbreviation %in% top_locs) |>
+  tidyr::pivot_longer(cols = c(observed, predicted),
+                      names_to = "type", values_to = "value") |>
+  mutate(
+    abbreviation = factor(abbreviation, levels = top_locs),
+    type = factor(type, levels = c("observed", "predicted")),
+    facet = factor(
+      paste0(group, ": ", model_id),
+      levels = facet_order
+    )
+  )
+
+p_snapshot <- snapshot_top |>
+  ggplot(aes(x = abbreviation, y = value, fill = type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  scale_fill_manual(values = c("observed" = "grey40", "predicted" = "#4393C3")) +
+  facet_wrap(~facet, scales = "free_y", ncol = 2) +
+  labs(
+    title = sprintf("Forecast vs observed for top 20 locations (%s, horizon 1)", focus_date),
+    subtitle = "Rows: good both, good MAE / bad VS, good VS / bad MAE",
+    x = "State (ordered by observed)", y = "Hospitalizations", fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        legend.position = "bottom")
+
+p_snapshot
+ggsave("variogram-flusight-analysis/plots/snapshot_profile.png",
+       p_snapshot, width = 10, height = 12, dpi = 150)
+```
+
+## Discussion
+
+```{r summary-stats}
+cat(sprintf("Spearman rank correlation (MAE vs VS): %.3f\n", rho))
+
+combined |>
+  mutate(
+    rank_diff = abs(mae_rank - vs_rank),
+    mae = round(mae, 2),
+    vs = round(vs, 1),
+    mae_rank = as.integer(mae_rank),
+    vs_rank = as.integer(vs_rank)
+  ) |>
+  arrange(desc(rank_diff)) |>
+  head(5) |>
+  select(model_id, mae, vs, mae_rank, vs_rank, rank_diff) |>
+  datatable(
+    colnames = c("Model", "MAE", "VS", "MAE rank", "VS rank", "Rank diff"),
+    caption = "Models with largest rank disagreement between MAE and VS",
+    options = list(pageLength = 5, dom = "t")
+  )
+```
+
+**Key observations**:
+
+1. **Correlation between metrics**: A Spearman correlation of `r round(rho, 3)`
+   indicates how much MAE and VS agree on model rankings. High correlation
+   suggests most models that are good at pointwise accuracy also capture
+   cross-location structure well. Low correlation would mean these are measuring
+   genuinely different aspects of forecast quality.
+
+2. **VS blindness to additive bias**: The variogram score is invariant to
+   constant additive bias --- a model that overshoots every location by the same
+   amount gets a perfect variogram score. Models that rank better on VS than MAE
+   may have this property: good relative structure but a level shift.
+
+3. **Horizon effects**: Both metrics typically degrade at longer horizons, but
+   the rate of degradation may differ. If VS degrades more slowly, it suggests
+   models maintain relative cross-location structure better than absolute
+   accuracy at longer lead times.
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

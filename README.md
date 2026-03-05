@@ -32,3 +32,4 @@ reichlab-analyses/
 | Directory | Description |
 |-----------|-------------|
 | `variogram-score-demo/` | Demonstrates how the variogram score evaluates pairwise differences across locations, contrasting it with MAE |
+| `variogram-flusight-analysis/` | Compares MAE and variogram score on FluSight median point forecasts for the 2025-26 flu season |
