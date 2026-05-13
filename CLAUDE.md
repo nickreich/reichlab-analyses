@@ -44,6 +44,7 @@ This repository contains small, self-contained analyses. Follow these rules when
 - **Notebooks** (`.qmd`, `.Rmd`, `.ipynb`) are encouraged for more complex analyses where narrative context helps tell the story. Use notebooks when an analysis builds up intuition incrementally, compares multiple approaches, or benefits from inline prose explaining the "why" alongside the code and results.
 - When creating a notebook, it should still be fully reproducible (render/run start-to-finish without manual intervention).
 - Rendered notebook output (`.html`) may be committed alongside the source if useful for sharing, but is not required.
+- **Default to hiding code in rendered reports.** For `.Rmd` use `code_folding: hide` in the YAML; for `.qmd` use `code-fold: true` with `code-summary` if useful; for `.ipynb` collapse cells by default. Readers should see the narrative and figures first and click to expand code when curious. Override only when the analysis is explicitly a code walkthrough.
 
 ## Languages
 

@@ -33,3 +33,5 @@ reichlab-analyses/
 |-----------|-------------|
 | `variogram-score-demo/` | Demonstrates how the variogram score evaluates pairwise differences across locations, contrasting it with MAE |
 | `variogram-flusight-analysis/` | Compares MAE and variogram score on FluSight median point forecasts for the 2025-26 flu season |
+| `cholera/` | Downloads the public African cholera surveillance and outbreak time series from Zheng et al. (Gates Open Research 10:16) and plots weekly series by location |
+| `trajectory-scoring-comparison/` | Demonstrates how marginal WIS misranks five caricature trajectory forecasters (including i.i.d. vs coherent wide hedgers), and recovers correct rankings via joint scores (energy, variogram) and CRPS on derived functionals (peak week, peak intensity, cumulative burden) |
