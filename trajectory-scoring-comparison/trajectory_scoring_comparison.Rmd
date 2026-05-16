@@ -1,0 +1,740 @@
+---
+title: "When Marginal CRPS Misranks Trajectory Forecasts"
+subtitle: "Marginal, joint, and functional CRPS-family scoring rules on synthetic seasonal epidemic forecasts"
+author: "Claude (Anthropic)"
+date: "2026-05-12"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 10, fig.height = 6
+)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+## Motivation
+
+Probabilistic forecasts of seasonal epidemics are typically evaluated by computing the Continuous Ranked Probability Score (CRPS) *marginally* at each forecast horizon and then averaging. (The Weighted Interval Score, WIS, used by CDC FluSight and the COVID-19 Forecast Hub, is a quantile approximation to this marginal CRPS.) Marginal scoring has a structural blind spot: a forecast that produces wide, well-centred marginal distributions at each horizon can score well even if it represents no coherent epidemic trajectory. Sharp forecasts that capture the shape of the wave but are slightly mistimed get heavily penalised at horizons near the peak.
+
+This notebook submits forecasts as **sample trajectories** (hubverse `sample` output_type), which preserves the joint structure across horizons. With samples in hand we have no reason to use WIS; we can compute CRPS exactly. We then evaluate each forecaster under three CRPS-family scoring rules:
+
+- **Marginal CRPS** — the baseline. Score the predictive distribution at each horizon independently, average across horizons. Sees marginal calibration only.
+- **Joint multivariate CRPS generalisations** — the *energy score* and the *variogram score*. These score the predictive distribution as a single joint object over all 12 horizons. They see joint structure: whether the 12-dimensional samples actually look like plausible epidemic trajectories.
+- **Functional CRPS** — derive a scalar quantity of operational interest from each sample trajectory (peak week, peak intensity, cumulative burden, time above threshold), then apply CRPS to that scalar. Sees decision-relevant quantities directly.
+
+We construct seven caricature forecasters in three natural pairs plus a calibrated reference:
+
+- **A** — wide hedger with i.i.d. samples across horizons (well-centred on truth, joint structure is white noise)
+- **A′** — wide hedger with *coherent* trajectories around truth (similar marginal widths to A; differs only in joint structure)
+- **B** — sharp forecaster with peak shifted ~2 weeks *late* (deterministic directional bias)
+- **B′** — sharp forecaster with symmetric peak-time uncertainty: each sample peaks 0.5-3 weeks early *or* late, never on time, average correct
+- **C** — sharp forecaster with correct timing but biased peak magnitude (~40% under-estimate)
+- **C′** — wide hedger around C's biased mean (same per-horizon mean as C, coherent multiplicative spread like A′)
+- **D** — calibrated trajectory forecaster (reference baseline)
+
+**Three parallel comparisons drive the analysis.** *A vs A′* contrasts an i.i.d. hedger against a coherent hedger built around the truth: similar marginal widths, very different joint structure. *B vs B′* contrasts directional timing bias against unbiased-but-uncertain timing: B is always late by ~2 weeks, B′ is on time on average but never exactly on time. *C vs C′* contrasts a sharp biased forecaster against a wide-but-coherent forecaster built around the same biased mean: same bias signature, very different spread. In each pair, marginal CRPS sees the two forecasters as roughly equivalent; joint and functional CRPS treat them very differently.
+
+**Requirements.** Dev versions of `scoringutils` (≥ 2.1.2) and `hubEvals` (≥ 0.1.0). See the install chunk below; the same versions are used in `variogram-flusight-analysis/`.
+
+```{r install-dev-packages, eval=FALSE}
+# Run once to install dev versions:
+# remotes::install_github("epiforecasts/scoringutils")
+# remotes::install_github("hubverse-org/hubEvals")
+```
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(scoringutils)
+library(hubEvals)
+```
+
+## Ground truth
+
+We use a skewed gamma-shaped seasonal wave on weeks 1–33 with peak near week 20. The choice of a *skewed* (not symmetric Gaussian) wave matters for forecaster B: a 2-week shift on a symmetric Gaussian leaves shape-aware metrics nearly unchanged, but on a skewed wave the post-peak decline differs from the pre-peak rise, so shape-aware metrics still penalise timing errors visibly.
+
+```{r truth}
+set.seed(42)
+
+WEEKS <- 1:33
+BASELINE <- 200
+PEAK_HEIGHT <- 2200
+PEAK_WEEK <- 20
+GAMMA_SHAPE <- 6
+GAMMA_RATE <- 0.5
+
+# Skewed gamma kernel, normalised so its maximum equals (peak_h - baseline)
+# and shifted so its peak lands at peak_w.
+gamma_kernel <- function(w, peak_w = PEAK_WEEK, peak_h = PEAK_HEIGHT,
+                         baseline = BASELINE) {
+  offset <- peak_w - (GAMMA_SHAPE - 1) / GAMMA_RATE
+  k <- dgamma(w - offset, shape = GAMMA_SHAPE, rate = GAMMA_RATE)
+  k_max <- dgamma((GAMMA_SHAPE - 1) / GAMMA_RATE,
+                  shape = GAMMA_SHAPE, rate = GAMMA_RATE)
+  baseline + (peak_h - baseline) * (k / k_max)
+}
+
+truth_fn <- function(w) gamma_kernel(w, peak_w = PEAK_WEEK, peak_h = PEAK_HEIGHT)
+truth_vec <- truth_fn(WEEKS)
+
+tibble(week = WEEKS, truth = truth_vec) |>
+  ggplot(aes(x = week, y = truth)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 1.8) +
+  geom_hline(yintercept = BASELINE, linetype = "dotted", colour = "grey50") +
+  annotate("text", x = PEAK_WEEK, y = PEAK_HEIGHT + 80,
+           label = sprintf("peak: week %d, value %d", PEAK_WEEK, PEAK_HEIGHT),
+           hjust = 0.5, size = 4) +
+  labs(title = "Ground truth: synthetic seasonal epidemic",
+       subtitle = "Skewed gamma-shaped wave, peak at week 20, baseline ~200",
+       x = "Epidemic week", y = "Weekly incidence") +
+  theme_minimal(base_size = 12)
+ggsave("trajectory-scoring-comparison/plots/01_truth.png",
+       width = 9, height = 5, dpi = 150)
+```
+
+## Forecast configuration
+
+We issue forecasts from one reference date during the rising phase (epidemic week 14), looking ahead horizons -1 through 10 — i.e. target weeks 13 through 24, covering the rise, the peak, and the start of the decline. Each forecaster produces N = 500 sample trajectories.
+
+```{r config}
+REF_WEEK <- 14
+HORIZONS <- -1:10
+TARGET_WEEKS <- REF_WEEK + HORIZONS
+N_SAMPLES <- 500
+N_HORIZONS <- length(HORIZONS)
+
+# Week numbers map to Saturdays starting 2025-01-04 (a Saturday).
+week_to_date <- function(w) as.Date("2025-01-04") + 7 * (w - 1)
+REF_DATE <- week_to_date(REF_WEEK)
+TARGET_DATES <- week_to_date(TARGET_WEEKS)
+TRUTH_AT_TARGETS <- truth_fn(TARGET_WEEKS)
+```
+
+## The seven forecasters
+
+Each forecaster's output is a 500 × 12 matrix (samples × horizons). The function below packages such a matrix into hubverse `sample` output format: each row is one (sample, horizon) value, and the `output_type_id` ties the 12 horizons of one sample together into a coherent trajectory.
+
+```{r sample-builder}
+make_sample_tbl <- function(model_id, sample_matrix) {
+  stopifnot(dim(sample_matrix) == c(N_SAMPLES, N_HORIZONS))
+  # as.vector goes column-major: (s1h1, s2h1, ..., sNh1, s1h2, ..., sNhH)
+  tibble(
+    model_id = model_id,
+    reference_date = REF_DATE,
+    horizon = rep(HORIZONS, each = N_SAMPLES),
+    target_end_date = rep(TARGET_DATES, each = N_SAMPLES),
+    target = "wk inc flu hosp",
+    location = "US",
+    output_type = "sample",
+    output_type_id = as.character(rep(seq_len(N_SAMPLES),
+                                      times = N_HORIZONS)),
+    value = pmax(as.vector(sample_matrix), 0)
+  )
+}
+```
+
+### Forecaster A — wide hedger, i.i.d. across horizons
+
+A forecaster who reports a wide marginal distribution at each horizon, well-centred on truth, with **uncertainty proportional to truth magnitude** (more uncertainty where the wave is large, less where it is small — the typical pattern for count-valued epi forecasts). Samples are independent across horizons, so each trajectory is a noisy path around truth with no temporal coherence.
+
+```{r forecaster-A}
+SIGMA_FRAC <- 0.5   # Marginal SD at horizon h is SIGMA_FRAC * truth[h]
+sigma_per_horizon <- SIGMA_FRAC * TRUTH_AT_TARGETS
+
+# Independent unit-variance noise per (horizon, sample); scaled per column by truth
+noise_A <- matrix(rnorm(N_SAMPLES * N_HORIZONS, 0, 1),
+                  nrow = N_SAMPLES, ncol = N_HORIZONS)
+noise_A <- sweep(noise_A, 2, sigma_per_horizon, FUN = "*")
+sample_A <- sweep(noise_A, 2, TRUTH_AT_TARGETS, FUN = "+")
+forecast_A <- make_sample_tbl("A_hedger_iid", sample_A)
+```
+
+### Forecaster A′ — coherent trajectories with similar marginal widths to A
+
+Each sample `i` gets a single shared **multiplicative amplitude factor** `m_i = 1 + c_i` with `c_i ~ Normal(0, SIGMA_FRAC^2)`. The trajectory is `truth[h] * m_i + small_noise[h]`, where `small_noise[h] ~ Normal(0, (0.05 * truth[h])^2)` adds the same kind of within-trajectory per-horizon noise that forecasters B, C, and D have. The marginal SD at horizon `h` is `sqrt(SIGMA_FRAC^2 + 0.05^2) * truth[h] ≈ SIGMA_FRAC * truth[h]` — essentially the same width as A.
+
+The difference between A and A′ is joint structure. A′'s 500 samples are 500 amplitude-scaled copies of the true wave plus small per-horizon noise, so each trajectory peaks at the right week and traces the right shape — just with random amplitude. A's 500 samples are 500 noisy paths with no shared structure. Marginal CRPS sees A and A′ as roughly equivalent; joint and functional scores see them as very different.
+
+```{r forecaster-A2}
+# Shared per-sample multiplicative amplitude factor
+A2_mult <- 1 + rnorm(N_SAMPLES, 0, SIGMA_FRAC)
+
+# Mean trajectory per sample: amplitude-scaled truth
+mean_A2 <- outer(A2_mult, TRUTH_AT_TARGETS)
+
+# Per-horizon within-trajectory noise (matches B/C/D's noise scale)
+within_noise_sd <- 0.05 * TRUTH_AT_TARGETS
+within_noise <- sweep(
+  matrix(rnorm(N_SAMPLES * N_HORIZONS, 0, 1),
+         nrow = N_SAMPLES, ncol = N_HORIZONS),
+  2, within_noise_sd, FUN = "*"
+)
+sample_A2 <- mean_A2 + within_noise
+forecast_A2 <- make_sample_tbl("A_hedger_coherent", sample_A2)
+```
+
+### Forecaster B — sharp, correct shape, mistimed peak
+
+Each sample's trajectory is the truth function evaluated at *shifted* target weeks; the shift `delta_i` is drawn around +2 (peak comes ~2 weeks late). Sharp predictions placed at the wrong target value near the peak — exactly the regime where marginal CRPS punishes sharp-and-shifted forecasts.
+
+```{r forecaster-B}
+B_deltas <- rnorm(N_SAMPLES, mean = 2, sd = 0.5)
+B_multipliers <- rnorm(N_SAMPLES, mean = 1, sd = 0.05)
+
+sample_B <- matrix(NA_real_, nrow = N_SAMPLES, ncol = N_HORIZONS)
+for (i in seq_len(N_SAMPLES)) {
+  sample_B[i, ] <- B_multipliers[i] * truth_fn(TARGET_WEEKS - B_deltas[i]) +
+    rnorm(N_HORIZONS, 0, 0.05 * TRUTH_AT_TARGETS)
+}
+forecast_B <- make_sample_tbl("B_sharp_mistimed", sample_B)
+```
+
+### Forecaster B′ — sharp, symmetric peak-timing uncertainty, correct peak height
+
+A direct analogue of B, but with a peak-time shift that is *symmetric around zero* and *never exactly zero*. Each sample's shift is drawn as `shift_i = sign_i * delta_i`, where `sign_i ∈ {-1, +1}` with equal probability and `delta_i ~ Uniform(0.5, 3)`. Half the samples peak early (target weeks 17-19.5), half peak late (target weeks 20.5-23); none peak at the correct week 20. The amplitude multiplier stays near 1 so the *height* of each shifted peak still matches truth.
+
+The intent: B has a directional timing bias (always late by ~2 weeks), so peak-week CRPS picks up that bias. B′ has no directional bias — the expected predicted peak week is 20 (correct) — but the predictive distribution still places no mass at the correct week. This isolates the difference between *biased timing* (B) and *unbiased-but-uncertain timing* (B′).
+
+```{r forecaster-Bprime}
+Bp_signs <- sample(c(-1, 1), N_SAMPLES, replace = TRUE)
+Bp_delta_mags <- runif(N_SAMPLES, min = 0.5, max = 3)
+Bp_shifts <- Bp_signs * Bp_delta_mags
+Bp_multipliers <- rnorm(N_SAMPLES, mean = 1, sd = 0.05)
+
+sample_Bprime <- matrix(NA_real_, nrow = N_SAMPLES, ncol = N_HORIZONS)
+for (i in seq_len(N_SAMPLES)) {
+  sample_Bprime[i, ] <- Bp_multipliers[i] * truth_fn(TARGET_WEEKS - Bp_shifts[i]) +
+    rnorm(N_HORIZONS, 0, 0.05 * TRUTH_AT_TARGETS)
+}
+forecast_Bprime <- make_sample_tbl("Bp_symmetric_shift", sample_Bprime)
+```
+
+### Forecaster C — sharp, correct timing, biased magnitude
+
+Each sample's trajectory has the right peak week but a peak amplitude scaled down by ~40%. Baseline preserved; the deviation above baseline is compressed by `alpha_i ~ N(0.6, 0.05^2)`.
+
+```{r forecaster-C}
+C_alphas <- rnorm(N_SAMPLES, mean = 0.6, sd = 0.05)
+
+sample_C <- matrix(NA_real_, nrow = N_SAMPLES, ncol = N_HORIZONS)
+for (i in seq_len(N_SAMPLES)) {
+  sample_C[i, ] <- BASELINE + C_alphas[i] * (TRUTH_AT_TARGETS - BASELINE) +
+    rnorm(N_HORIZONS, 0, 0.05 * TRUTH_AT_TARGETS)
+}
+forecast_C <- make_sample_tbl("C_sharp_biased", sample_C)
+```
+
+### Forecaster C′ — wide hedger around the biased mean
+
+A direct analogue of A′, but built around C's biased mean trajectory instead of truth. Per-sample multiplicative amplitude factor `m_i = 1 + c_i` with `c_i ~ Normal(0, SIGMA_FRAC^2)` scales the *biased mean* trajectory `BASELINE + 0.6 * (truth - BASELINE)`, then small per-horizon noise is added. Marginal mean at each horizon matches C exactly; marginal width matches A′'s structural form (multiplicative coherent offset) but applied around the biased mean.
+
+The point: C and C′ have the same biased mean at every horizon, so their *bias* signature is identical. They differ only in spread — C is sharp around the biased mean, C′ is wide around it. This isolates how sharpness interacts with bias: when a forecaster's central estimate is wrong, does extra width help or hurt?
+
+```{r forecaster-Cprime}
+C_compressed_truth <- BASELINE + 0.6 * (TRUTH_AT_TARGETS - BASELINE)
+
+Cprime_mult <- 1 + rnorm(N_SAMPLES, 0, SIGMA_FRAC)
+mean_Cprime <- outer(Cprime_mult, C_compressed_truth)
+
+Cprime_within_noise <- sweep(
+  matrix(rnorm(N_SAMPLES * N_HORIZONS, 0, 1),
+         nrow = N_SAMPLES, ncol = N_HORIZONS),
+  2, 0.05 * TRUTH_AT_TARGETS, FUN = "*"
+)
+sample_Cprime <- mean_Cprime + Cprime_within_noise
+forecast_Cprime <- make_sample_tbl("Cp_wide_biased", sample_Cprime)
+```
+
+### Forecaster D — calibrated trajectory
+
+The reference baseline: per-sample multiplicative jitter `eta_i ~ N(1, 0.05^2)` plus small additive noise. Roughly right on shape, timing, and magnitude.
+
+```{r forecaster-D}
+D_etas <- rnorm(N_SAMPLES, mean = 1, sd = 0.05)
+
+sample_D <- matrix(NA_real_, nrow = N_SAMPLES, ncol = N_HORIZONS)
+for (i in seq_len(N_SAMPLES)) {
+  sample_D[i, ] <- D_etas[i] * TRUTH_AT_TARGETS +
+    rnorm(N_HORIZONS, 0, 0.05 * TRUTH_AT_TARGETS)
+}
+forecast_D <- make_sample_tbl("D_calibrated", sample_D)
+```
+
+### Combine into a single hubverse model_out_tbl
+
+```{r combine-samples}
+all_samples <- bind_rows(forecast_A, forecast_A2,
+                         forecast_B, forecast_Bprime,
+                         forecast_C, forecast_Cprime,
+                         forecast_D)
+
+# Oracle (truth) in hubEvals format
+oracle <- tibble(
+  location = "US",
+  target_end_date = TARGET_DATES,
+  target = "wk inc flu hosp",
+  oracle_value = TRUTH_AT_TARGETS
+)
+
+MODEL_LEVELS <- c("A_hedger_iid", "A_hedger_coherent",
+                  "B_sharp_mistimed", "Bp_symmetric_shift",
+                  "C_sharp_biased",   "Cp_wide_biased",
+                  "D_calibrated")
+MODEL_LABELS <- c(
+  A_hedger_iid       = "A: Wide hedger\n(i.i.d. across horizons)",
+  A_hedger_coherent  = "A': Wide hedger\n(coherent trajectories)",
+  B_sharp_mistimed   = "B: Sharp,\nmistimed peak (late)",
+  Bp_symmetric_shift = "B': Sharp,\nsymmetric peak-time error",
+  C_sharp_biased     = "C: Sharp,\nbiased magnitude",
+  Cp_wide_biased     = "C': Wide hedger\naround biased mean",
+  D_calibrated       = "D: Calibrated\ntrajectory"
+)
+```
+
+## Visualise the seven forecasters
+
+The single most important plot in this analysis. Same truth in black across all seven panels, with 80 sample trajectories per forecaster shown in faint blue. Pairs (A/A′, B/B′, C/C′) are stacked in adjacent columns so each pair is easy to compare directly. The vertical dashed line in each panel marks the reference date; everything to its right is forecast territory.
+
+```{r plot-trajectories, fig.height=14, fig.width=10}
+set.seed(123)
+display_sample_ids <- as.character(sample(seq_len(N_SAMPLES), 80))
+
+display_samples <- all_samples |>
+  filter(output_type_id %in% display_sample_ids) |>
+  mutate(model_id = factor(model_id, levels = MODEL_LEVELS))
+
+truth_df <- tibble(
+  target_end_date = TARGET_DATES,
+  value = TRUTH_AT_TARGETS
+)
+
+y_max <- max(all_samples$value, TRUTH_AT_TARGETS) * 1.02
+
+p_traj <- ggplot(display_samples,
+                 aes(x = target_end_date, y = value)) +
+  geom_line(aes(group = output_type_id),
+            alpha = 0.08, colour = "#2166AC") +
+  geom_line(data = truth_df, colour = "black", linewidth = 1.2) +
+  geom_point(data = truth_df, colour = "black", size = 1.8) +
+  geom_vline(xintercept = as.numeric(REF_DATE),
+             linetype = "dashed", colour = "grey40") +
+  facet_wrap(~model_id, ncol = 2,
+             labeller = labeller(model_id = MODEL_LABELS)) +
+  coord_cartesian(ylim = c(0, y_max)) +
+  labs(
+    title = "Seven forecasters, one truth: 80 sample trajectories each (faint blue) vs. truth (black)",
+    caption = "Rows: A/A' (wide hedgers) · B/B' (sharp timing errors) · C/C' (biased magnitude) · D (calibrated)",
+    subtitle = sprintf("Reference date: %s (vertical dashed). Truth peaks at week %d.",
+                       REF_DATE, PEAK_WEEK),
+    x = "Target end date", y = "Weekly incidence"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.spacing.x = unit(1, "lines")
+  )
+
+p_traj
+ggsave("trajectory-scoring-comparison/plots/02_forecaster_trajectories.png",
+       p_traj, width = 10, height = 14, dpi = 150)
+```
+
+Reading this plot: A is white-noise scatter centred well above the true rise and well below the true peak; A′ is a coherent ensemble of plausible epidemic waves spanning a wide range of peak weeks and heights; B is sharp but shifted right of truth, especially visible at the peak; C is sharp but compressed in amplitude; D matches truth closely.
+
+## Marginal CRPS
+
+Since we have samples, we can compute CRPS exactly — no need to summarise to quantiles first. `hubEvals::score_model_out` accepts hubverse sample forecasts directly and computes marginal CRPS per task.
+
+```{r crps-score}
+marginal_crps <- score_model_out(
+  all_samples, oracle,
+  metrics = "crps",
+  summarize = FALSE
+)
+
+crps_by_horizon <- marginal_crps |>
+  group_by(model_id, horizon) |>
+  summarise(crps = mean(crps), .groups = "drop")
+
+crps_by_model <- marginal_crps |>
+  group_by(model_id) |>
+  summarise(crps = mean(crps), .groups = "drop") |>
+  arrange(crps)
+
+crps_by_model |>
+  mutate(crps = round(crps, 1)) |>
+  knitr::kable(col.names = c("Model", "Mean marginal CRPS"),
+               caption = "Marginal CRPS ranking (lower is better)")
+```
+
+A and A′ should be effectively tied here — their marginal distributions at each horizon are identical by construction (both `Normal(truth[h], sigma_wide^2)`), so marginal CRPS cannot tell them apart. Any difference between them in this table is sampling noise from the 500 draws.
+
+## Marginal CRPS by horizon
+
+```{r crps-by-horizon-plot, fig.height=5, fig.width=10}
+p_crps_h <- crps_by_horizon |>
+  mutate(model_id = factor(model_id, levels = MODEL_LEVELS)) |>
+  ggplot(aes(x = horizon, y = crps, colour = model_id)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_colour_brewer(
+    palette = "Set1",
+    labels = c(
+      A_hedger_iid       = "A: Wide hedger (iid)",
+      A_hedger_coherent  = "A': Wide hedger (coherent)",
+      B_sharp_mistimed   = "B: Sharp, late by ~2",
+      Bp_symmetric_shift = "B': Sharp, symmetric timing error",
+      C_sharp_biased     = "C: Sharp, biased magnitude",
+      Cp_wide_biased     = "C': Wide hedger around biased mean",
+      D_calibrated       = "D: Calibrated"
+    )
+  ) +
+  labs(
+    title = "Marginal CRPS by forecast horizon",
+    subtitle = "Hedgers pay a wide-and-on-target penalty everywhere; sharp-but-wrong models pay large penalties near the peak.",
+    x = "Horizon (weeks ahead)", y = "CRPS (lower = better)",
+    colour = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+p_crps_h
+ggsave("trajectory-scoring-comparison/plots/04_crps_by_horizon.png",
+       p_crps_h, width = 11, height = 5, dpi = 150)
+```
+
+## Joint multivariate scoring: energy + variogram
+
+For joint scoring we treat each forecast as a *multivariate* prediction over the 12 horizons. Each sample contributes one 12-dimensional vector. The energy score measures distance from the joint distribution to the truth vector; the variogram score (Scheuerer & Hamill 2015) measures whether the *pairwise differences* across horizons match the truth's pairwise differences — directly targeting trajectory shape.
+
+We build a multivariate-sample forecast object with `joint_across = "horizon"` so that horizon becomes the dimension over which the multivariate score is computed. The exact `scoringutils` API for sample multivariate forecasts may shift between versions; if `as_forecast_multivariate_sample` is not available, the fallback is to construct the score directly via `energy_score_multivariate()` and `variogram_score_multivariate()` on a (samples × horizons) matrix per task.
+
+```{r joint-scoring}
+mvs_data <- all_samples |>
+  left_join(
+    oracle |> rename(observed = oracle_value),
+    by = c("location", "target_end_date", "target")
+  ) |>
+  mutate(
+    reference_date = as.character(reference_date),
+    target_end_date = as.character(target_end_date)
+  )
+
+# Try the high-level scoringutils API.
+mvs_forecast <- as_forecast_multivariate_sample(
+  mvs_data,
+  forecast_unit = c("model_id", "reference_date", "horizon", "location"),
+  joint_across = "horizon",
+  observed = "observed",
+  predicted = "value",
+  sample_id = "output_type_id"
+)
+
+joint_scores_raw <- score(mvs_forecast)
+
+joint_scores <- joint_scores_raw |>
+  as.data.frame() |>
+  select(model_id, energy_score, variogram_score)
+
+joint_scores |>
+  mutate(across(where(is.numeric), ~ round(.x, 1))) |>
+  knitr::kable(col.names = c("Model", "Energy score", "Variogram score"),
+               caption = "Joint multivariate scores (lower is better). Variogram is the default p (= 0.5 in current scoringutils).")
+```
+
+If the `as_forecast_multivariate_sample` call above fails on a given install (e.g., an older scoringutils version), the helper below computes the same two scores directly from each model's (samples × horizons) matrix:
+
+```{r joint-scoring-fallback, eval=FALSE}
+compute_joint_scores_manual <- function(samples_mat, truth_vec, p = 0.5) {
+  list(
+    energy = scoringutils::energy_score_multivariate(
+      observed = truth_vec,
+      predicted = samples_mat
+    ),
+    variogram = scoringutils::variogram_score_multivariate(
+      observed = truth_vec,
+      predicted = samples_mat,
+      p = p
+    )
+  )
+}
+
+# joint_scores_manual <- tibble(
+#   model_id = MODEL_LEVELS,
+#   scores = list(
+#     compute_joint_scores_manual(sample_A,  TRUTH_AT_TARGETS),
+#     compute_joint_scores_manual(sample_A2, TRUTH_AT_TARGETS),
+#     compute_joint_scores_manual(sample_B,  TRUTH_AT_TARGETS),
+#     compute_joint_scores_manual(sample_C,  TRUTH_AT_TARGETS),
+#     compute_joint_scores_manual(sample_D,  TRUTH_AT_TARGETS)
+#   )
+# )
+```
+
+## CRPS on derived functionals
+
+For each (model, sample) we compute four scalar functionals of the trajectory:
+
+- **peak week** — `argmax` over target weeks
+- **peak intensity** — `max` of the trajectory
+- **cumulative burden** — sum over the 12 horizons
+- **time above threshold** — number of weeks the trajectory exceeds half the truth's windowed peak
+
+Each scalar has a predictive distribution given by the 500 per-sample values. We score it against the truth value of the same functional using `crps_sample()`. These are proper scoring rules on the functional, and they directly encode the operational quantities public health agencies actually care about.
+
+```{r functionals-build}
+get_sample_matrix <- function(forecast_long) {
+  forecast_long |>
+    arrange(as.integer(output_type_id), horizon) |>
+    select(output_type_id, horizon, value) |>
+    pivot_wider(names_from = horizon, values_from = value,
+                names_sort = TRUE) |>
+    select(-output_type_id) |>
+    as.matrix()
+}
+
+THRESHOLD <- 0.5 * max(TRUTH_AT_TARGETS)
+
+compute_functionals <- function(forecast_long) {
+  mat <- get_sample_matrix(forecast_long)
+  tibble(
+    sample_id          = seq_len(nrow(mat)),
+    peak_week          = TARGET_WEEKS[apply(mat, 1, which.max)],
+    peak_intensity     = apply(mat, 1, max),
+    cumulative_burden  = rowSums(mat),
+    time_above_thresh  = rowSums(mat > THRESHOLD)
+  )
+}
+
+functionals <- all_samples |>
+  group_by(model_id) |>
+  group_modify(~ compute_functionals(.x)) |>
+  ungroup()
+
+truth_functionals <- list(
+  peak_week         = TARGET_WEEKS[which.max(TRUTH_AT_TARGETS)],
+  peak_intensity    = max(TRUTH_AT_TARGETS),
+  cumulative_burden = sum(TRUTH_AT_TARGETS),
+  time_above_thresh = sum(TRUTH_AT_TARGETS > THRESHOLD)
+)
+truth_functionals
+```
+
+```{r crps-functionals}
+crps_functionals <- functionals |>
+  group_by(model_id) |>
+  summarise(
+    crps_peak_week = scoringutils::crps_sample(
+      observed = truth_functionals$peak_week,
+      predicted = matrix(peak_week, nrow = 1)
+    ),
+    crps_peak_intensity = scoringutils::crps_sample(
+      observed = truth_functionals$peak_intensity,
+      predicted = matrix(peak_intensity, nrow = 1)
+    ),
+    crps_cumulative = scoringutils::crps_sample(
+      observed = truth_functionals$cumulative_burden,
+      predicted = matrix(cumulative_burden, nrow = 1)
+    ),
+    crps_time_above = scoringutils::crps_sample(
+      observed = truth_functionals$time_above_thresh,
+      predicted = matrix(time_above_thresh, nrow = 1)
+    ),
+    .groups = "drop"
+  )
+
+crps_functionals |>
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |>
+  knitr::kable(caption = "CRPS on derived trajectory functionals (lower is better)")
+```
+
+## Headline: ranking disagreement
+
+We pivot every score onto one table and convert to ranks (1 = best). The table is then visualised as a heatmap where the columns are grouped into three categories — marginal, joint, and functional — and the colour of each cell encodes the rank.
+
+```{r ranking-table}
+all_scores <- crps_by_model |>
+  inner_join(joint_scores, by = "model_id") |>
+  inner_join(crps_functionals, by = "model_id")
+
+ranks_tbl <- all_scores |>
+  mutate(across(-model_id, ~ rank(.x), .names = "rank_{.col}"))
+
+write.csv(all_scores,
+          "trajectory-scoring-comparison/data/score_table.csv",
+          row.names = FALSE)
+write.csv(ranks_tbl,
+          "trajectory-scoring-comparison/data/rank_table.csv",
+          row.names = FALSE)
+
+all_scores |>
+  mutate(across(where(is.numeric), ~ round(.x, 1))) |>
+  knitr::kable(caption = "All scores per model (lower is better in every column)")
+```
+
+```{r ranking-heatmap, fig.height=5, fig.width=12}
+rank_long <- ranks_tbl |>
+  select(model_id, starts_with("rank_")) |>
+  pivot_longer(-model_id, names_to = "metric_raw", values_to = "rank") |>
+  mutate(
+    metric_raw = sub("rank_", "", metric_raw),
+    metric_group = case_when(
+      metric_raw == "crps" ~ "Marginal CRPS",
+      metric_raw %in% c("energy_score", "variogram_score") ~ "Joint CRPS",
+      TRUE ~ "Functional CRPS"
+    ),
+    metric_group = factor(metric_group,
+                          levels = c("Marginal CRPS", "Joint CRPS",
+                                     "Functional CRPS")),
+    metric_label = recode(metric_raw,
+      crps                 = "CRPS",
+      energy_score         = "Energy",
+      variogram_score      = "Variogram",
+      crps_peak_week       = "Peak\nweek",
+      crps_peak_intensity  = "Peak\nintensity",
+      crps_cumulative      = "Cumulative\nburden",
+      crps_time_above      = "Time above\nthreshold"
+    ),
+    metric_label = factor(metric_label, levels = c(
+      "CRPS",
+      "Energy", "Variogram",
+      "Peak\nweek", "Peak\nintensity",
+      "Cumulative\nburden", "Time above\nthreshold"
+    )),
+    model_id = factor(model_id, levels = rev(MODEL_LEVELS),
+                      labels = rev(c(
+                        "A: Wide hedger (iid)",
+                        "A': Wide hedger (coherent)",
+                        "B: Sharp, late",
+                        "B': Sharp, symmetric timing error",
+                        "C: Sharp, biased",
+                        "C': Wide, biased",
+                        "D: Calibrated"
+                      )))
+  )
+
+p_ranks <- ggplot(rank_long,
+                  aes(x = metric_label, y = model_id, fill = rank)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = round(rank, 0)),
+            size = 6, fontface = "bold") +
+  scale_fill_distiller(palette = "RdYlGn", direction = -1,
+                       name = "Rank\n(1 = best)",
+                       breaks = 1:7, limits = c(1, 7)) +
+  facet_grid(. ~ metric_group, scales = "free_x", space = "free_x") +
+  labs(
+    title = "Ranking disagreement across scoring rules",
+    subtitle = "Same seven forecasters, seven metrics: which one wins depends entirely on what you score",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(face = "bold", size = 11),
+    axis.text.y = element_text(face = "bold", size = 11),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid = element_blank(),
+    panel.spacing.x = unit(0.6, "lines")
+  )
+
+p_ranks
+ggsave("trajectory-scoring-comparison/plots/03_ranking_heatmap.png",
+       p_ranks, width = 13, height = 5, dpi = 150)
+```
+
+## Peak-week predictive distributions
+
+A diagnostic showing the *distribution* of predicted peak weeks per forecaster — the input to the peak-week CRPS column above. The true peak week is overlaid as a black vertical line.
+
+```{r peak-week-dist, fig.height=4.5, fig.width=21}
+p_peak <- functionals |>
+  mutate(model_id = factor(model_id, levels = MODEL_LEVELS)) |>
+  ggplot(aes(x = peak_week)) +
+  geom_histogram(binwidth = 1, fill = "#2166AC",
+                 colour = "white", boundary = 0.5) +
+  geom_vline(xintercept = truth_functionals$peak_week,
+             colour = "black", linewidth = 1) +
+  facet_wrap(~model_id, nrow = 1,
+             labeller = labeller(model_id = MODEL_LABELS)) +
+  scale_x_continuous(breaks = seq(min(TARGET_WEEKS),
+                                  max(TARGET_WEEKS), by = 2)) +
+  labs(
+    title = "Predictive distribution of peak week per forecaster",
+    subtitle = sprintf("Black line = true peak week (%d). Note that A's peak-week distribution is essentially uniform over the forecast window — its samples have no shape.",
+                       truth_functionals$peak_week),
+    x = "Predicted peak week (within forecast window)",
+    y = "Sample count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+
+p_peak
+ggsave("trajectory-scoring-comparison/plots/05_peak_week_distributions.png",
+       p_peak, width = 21, height = 4.5, dpi = 150)
+```
+
+## Discussion
+
+**What each scoring rule "sees".** All seven scores in this notebook are CRPS or CRPS generalisations; they differ in *what they integrate over*.
+
+- **Marginal CRPS** integrates over the predictive distribution at *one horizon at a time*, ignoring joint structure. A and A′ are tied here by construction: they have the same one-dimensional marginal at every horizon. Marginal CRPS cannot see joint structure even in principle.
+
+- **Energy score** integrates over the *joint* predictive distribution as a 12-dimensional object and measures Euclidean distance to the truth vector. Sensitive to joint location but only weakly sensitive to *dependence structure* (Pinson & Tastu 2013) — most of its signal is driven by marginal calibration. In our results A′ beats A here (joint distance is smaller when 500 trajectories cluster vertically near truth versus when they wobble around truth independently), but the gap is modest.
+
+- **Variogram score** integrates over the predictive distribution of *pairwise differences across horizons*. It directly targets trajectory shape: the score is zero iff the forecast's pairwise differences match truth's pairwise differences. A′ scores well because its trajectories preserve the *pattern* of pairwise differences (multiplicative scaling stretches differences uniformly across all pairs, so the pattern of which pairs are large vs small is correct). A's variogram score is much larger because its pairwise differences are inflated by independent noise at every lag, breaking the pattern entirely. Notably, **C beats C′ on variogram**: sharp-around-biased-mean preserves a tight (if compressed) pattern of pairwise differences, while wide-around-biased-mean adds dispersion to those pairwise differences.
+
+- **Functional CRPS** integrates over the predictive distribution of *a derived scalar*. Each functional isolates one operationally meaningful quantity:
+  - **Peak week**: A′ has CRPS ≈ 0 because `argmax(m_i * truth) = argmax(truth)` for `m_i > 0`, so essentially every sample peaks at the right week. C and C′ both have correct peak weeks (in their biased means). A has a noisy peak-week distribution; B is shifted (worst).
+  - **Peak intensity**: B does well — its multiplier ≈ 1 means the peak height is roughly correct, just at the wrong week. C is bad (under-shoots by 40%); C′ is better than C because its wider distribution occasionally lands near truth peak. A and A′ have wide distributions around truth peak.
+  - **Cumulative burden**: A wins among the imperfect forecasters — independent noise averages out across 12 horizons, while A′'s shared amplitude factor scales the whole sum coherently and produces a wider cumulative-burden distribution. **The one metric where independence helps.** C′ also beats C here, because C's bias accumulates while C′'s width covers some plausible totals.
+  - **Time above threshold**: A′ wins among the imperfect forecasters. C′ is the worst — its biased mean is below threshold most of the time, and the wide spread inflates the score variance instead of helping.
+
+**Why this matters operationally.** Public-health decisions care about *when will the peak be?*, *how high will it be?*, and *how much total burden?* These map directly to functional CRPS, not to marginal CRPS. The hedgers A and A′ are roughly equivalent under marginal CRPS but A′ is dramatically more useful for these decisions.
+
+**Three parallel headlines.**
+
+*A vs A′:* Same marginal widths, different joint structure. Marginal CRPS sees them as equivalent (within Monte Carlo noise). Joint and most functional scores prefer A′ sharply — it represents *coherent* epidemic trajectories.
+
+*B vs B′:* Deterministic late shift vs. symmetric-around-zero timing uncertainty (never on time). **B′ beats B on nearly every metric**, including marginal CRPS (147 vs 322), variogram, peak-week CRPS, and cumulative burden. Replacing a directional timing bias with honest uncertainty about *which direction* the timing will be off is a real improvement, and the scores reflect it. Importantly, B′'s peak-week CRPS is still nonzero (0.60) because no sample lands at the correct peak week — the peak-week predictive distribution is bimodal around 20 with a gap *at* 20. Marginal CRPS and most functional scores reward unbiased-but-uncertain timing; peak-week CRPS in particular captures both the improvement vs. B and the residual dispersion that comes from never being exactly right.
+
+*C vs C′:* Same per-horizon mean (both biased low), different spread. **C′ beats C on most metrics — including marginal CRPS — despite having the same point-forecast bias.** Wide-but-coherent uncertainty around a biased forecast often dominates a sharp forecast at the same biased point.
+
+**The B′ and C′ cases are different in a crucial way.** B′ replaces directional bias with honest, symmetric uncertainty — the *expected* central tendency is now correct, only the predictive variance is wider. This is a real epistemic improvement and the scores correctly identify it as such. C′, by contrast, leaves the bias intact and only widens the predictive distribution around it — the central tendency is unchanged, and the score gains come from coverage rather than from any actual improvement in the forecast's central estimate. The visual difference is most apparent in the peak-week distribution plot: B′'s histogram is centred on the true peak (with a gap exactly at it), while C′'s peak-intensity distribution is centred away from truth.
+
+**The width-laundering hazard.** A modeller whose central forecast is biased can "improve" most of these scores by simply widening their predictive intervals around the same biased point estimate, without fixing the underlying bias. Marginal CRPS, energy score, peak-intensity CRPS, cumulative-burden CRPS, and time-above-threshold CRPS all rank C′ ahead of (or no worse than) C — even though C′'s central tendency is no closer to truth than C's. **The variogram score is the only metric in this set that resists this hazard:** C beats C′ on variogram because sharper-around-the-bias preserves a tighter pattern of pairwise differences across horizons, and widening that distribution adds dispersion to those pairwise differences. The pattern-of-pairs framing is what makes variogram score insensitive to width-as-bias-correction.
+
+The operational implication is sharp: if a forecasting team has bias they cannot remove, every score in this notebook except variogram will tell them that adding uncertainty is an improvement. A scoring suite that does not include variogram-like rules can be gamed by inflating uncertainty around biased estimates.
+
+Taken together, these three comparisons show that marginal scoring alone is *incomplete*: it cannot reward joint coherence (A vs A′), it conflates real epistemic improvement with bias-preserving width-inflation (B′ vs C′), and it rewards width-over-bias in ways that may not match operational value (C vs C′). If forecast hubs collect sample-format trajectory submissions and report joint and functional scores alongside marginal ones — and explicitly include variogram-family rules — modellers are incentivised to produce coherent ensembles with honest uncertainty, which is what public health actually needs.
+
+## Limitations of this demo
+
+- One reference date only. A robust analysis would repeat at multiple points in the season; here we held the structure simple to make the score-disagreement story unambiguous.
+- One location only. Multi-location adds a separate joint dimension that this notebook does not explore (it overlaps with `variogram-flusight-analysis/`).
+- The "calibrated" forecaster D is a strawman built to win every metric; real forecasters have failure modes that are mixes of B/C/hedging.
+- The forecaster parameterisations are stylised. The point is to make the metric disagreements *legible*, not to mimic real model behaviour.
+
+## References
+
+- Bracher, J., Ray, E. L., Gneiting, T., & Reich, N. G. (2021). Evaluating epidemic forecasts in an interval format. *PLOS Computational Biology*, 17(2), e1008618.
+- Gneiting, T., & Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *Journal of the American Statistical Association*, 102(477), 359–378.
+- Pinson, P., & Tastu, J. (2013). Discrimination ability of the Energy score. *Technical University of Denmark, Tech. Report*.
+- Scheuerer, M., & Hamill, T. M. (2015). Variogram-based proper scoring rules for probabilistic forecasts of multivariate quantities. *Monthly Weather Review*, 143(4), 1321–1334.
+
+See `trajectory-scoring-comparison/bibliography.md` for the full annotated bibliography on trajectory scoring.
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

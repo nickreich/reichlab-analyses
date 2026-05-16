@@ -1,0 +1,666 @@
+---
+title: "Forecast scoring through small examples"
+subtitle: "NYC ILI ED visits, 2025/26 season — illustrating how different scoring rules rank forecasts"
+author: "Nicholas Reich"
+date: "2026-05-13"
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    embed-resources: true
+    fig-width: 11
+    fig-height: 5.5
+    fig-dpi: 150
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{=html}
+<style>
+  /* Compact, top-aligned panel tabsets */
+  .reveal .panel-tabset { margin-top: 0; }
+  .reveal .panel-tabset > .nav-tabs {
+    font-size: 0.5em;
+    margin: 0 0 0.2em 0;
+    padding: 0;
+    border-bottom: 1px solid #999;
+  }
+  .reveal .panel-tabset > .nav-tabs .nav-link {
+    padding: 0.1em 0.6em;
+    margin: 0;
+  }
+  .reveal .panel-tabset > .tab-content {
+    padding-top: 0.1em;
+  }
+</style>
+```
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(scoringutils)
+library(knitr)
+```
+
+## Setup
+
+Each example uses real weekly observations from the [MetroCast Hub](https://github.com/reichlab/flu-metrocast) for **NYC, ILI ED visits %** during the 2025/26 season. Two stylised forecasts (Model X and Model Y) are shown with **95% prediction intervals**, then evaluated under several scoring rules.
+
+The forecasts are illustrative caricatures designed to expose how each scoring rule responds to specific failure modes (bias, sharpness, joint coherence, etc.). They are not real submissions to the hub.
+
+```{r load-data}
+# latest-data.csv has full historical observed values (no as_of versioning);
+# oracle-output.csv only covers the 2025/26 forecast/scoring window.
+truth_url <- "https://raw.githubusercontent.com/reichlab/flu-metrocast/main/target-data/latest-data.csv"
+truth <- read_csv(truth_url, show_col_types = FALSE) |>
+  filter(location == "nyc", target == "ILI ED visits pct") |>
+  mutate(target_end_date = as.Date(target_end_date)) |>
+  rename(oracle_value = observation) |>
+  arrange(target_end_date)
+```
+
+```{r forecast-helpers}
+# Generate N_SAMPLES sample trajectories with prescribed per-horizon median and SD.
+# Most of the variance is "shared across horizons" (a smooth per-sample offset)
+# so trajectories look like smooth-ish curves rather than jagged noise.
+# `dist = "normal"` gives symmetric intervals; `dist = "lognormal"` gives
+# tighter lower tail and wider upper tail (natural for count-valued epi targets).
+generate_forecast <- function(model_id, medians, sds, target_dates,
+                              dist = c("normal", "lognormal"),
+                              floor = 0,
+                              n_samples = 200, shared_frac = 0.9, seed = NULL) {
+  dist <- match.arg(dist)
+  if (!is.null(seed)) set.seed(seed)
+  shift_sd <- shared_frac * sds
+  noise_sd <- sqrt(1 - shared_frac^2) * sds
+  H <- length(medians)
+  u <- rnorm(n_samples)   # per-sample standardized offset shared across horizons
+  mat <- matrix(NA_real_, nrow = n_samples, ncol = H)
+  for (h in seq_len(H)) {
+    if (dist == "normal") {
+      mat[, h] <- medians[h] + u * shift_sd[h] +
+        rnorm(n_samples, 0, noise_sd[h])
+    } else {
+      # (Shifted) lognormal: value = floor + exp(mu + sigma*Z), with mu chosen
+      # so that median(value) = medians[h] and sigma controls the upper-tail
+      # spread. `floor` (>= 0) sets a soft lower bound on sample trajectories.
+      stopifnot(all(medians > floor))
+      log_val <- log(medians[h] - floor) + u * shift_sd[h] +
+        rnorm(n_samples, 0, noise_sd[h])
+      mat[, h] <- floor + exp(log_val)
+    }
+  }
+  mat <- pmax(mat, 0)
+  tibble(
+    model_id = model_id,
+    sample_id = rep(seq_len(n_samples), times = H),
+    target_end_date = rep(target_dates, each = n_samples),
+    horizon = rep(seq_len(H), each = n_samples),
+    value = as.vector(mat)
+  )
+}
+
+PI_LEVEL <- 0.95   # central PI level used throughout
+PI_TAIL  <- (1 - PI_LEVEL) / 2  # e.g., 0.025 for a 95% PI
+
+summarise_bands <- function(forecast_df) {
+  forecast_df |>
+    group_by(model_id, target_end_date, horizon) |>
+    summarise(
+      lower  = quantile(value, PI_TAIL,     type = 7),
+      median = quantile(value, 0.50,        type = 7),
+      upper  = quantile(value, 1 - PI_TAIL, type = 7),
+      .groups = "drop"
+    )
+}
+
+# Stacked plot, one of two scale modes:
+#   scale = "linear" -> trajectories + median (top), 95% PI + median (bottom), linear y
+#   scale = "log"    -> trajectories + median (top), 95% PI + median (bottom), log10 y
+# Used inside Quarto panel-tabsets so the viewer can toggle scales.
+plot_forecast_panel <- function(truth_window, forecast_df, ref_date,
+                                title, subtitle = NULL,
+                                model_colors = c("Model X" = "#4477AA",
+                                                 "Model Y" = "#DDAA33"),
+                                n_display_trajectories = 80,
+                                y_lim = c(0, 16),
+                                y_lim_log = c(0.8, 40),
+                                scale = c("linear", "log"),
+                                display_seed = 42) {
+  scale <- match.arg(scale)
+  bands <- summarise_bands(forecast_df)
+
+  # Deterministic subsample so the linear and log tabs show the same trajectories
+  set.seed(display_seed)
+  display_ids <- forecast_df |>
+    distinct(model_id, sample_id) |>
+    group_by(model_id) |>
+    slice_sample(n = n_display_trajectories) |>
+    ungroup()
+  forecast_display <- forecast_df |>
+    semi_join(display_ids, by = c("model_id", "sample_id"))
+
+  base_layers <- list(
+    geom_line(data = truth_window,
+              aes(x = target_end_date, y = oracle_value),
+              colour = "grey20", linewidth = 0.7),
+    geom_point(data = truth_window,
+               aes(x = target_end_date, y = oracle_value),
+               colour = "grey20", size = 1.8),
+    geom_vline(xintercept = as.numeric(ref_date),
+               linetype = "dashed", colour = "grey50"),
+    scale_colour_manual(values = model_colors, name = NULL,
+                        aesthetics = c("colour", "fill")),
+    theme_minimal(base_size = 13),
+    theme(legend.position = "top",
+          plot.subtitle = element_text(face = "italic", colour = "grey30"))
+  )
+
+  median_layers <- list(
+    geom_line(data = bands,
+              aes(x = target_end_date, y = median, colour = model_id),
+              linewidth = 1),
+    geom_point(data = bands,
+               aes(x = target_end_date, y = median, colour = model_id),
+               size = 2.2)
+  )
+
+  trajectory_layer <- geom_line(
+    data = forecast_display,
+    aes(x = target_end_date, y = value,
+        group = interaction(model_id, sample_id),
+        colour = model_id),
+    alpha = 0.12, linewidth = 0.3
+  )
+
+  if (scale == "linear") {
+    y_scale_layer <- coord_cartesian(ylim = y_lim)
+    y_label <- "% of ED visits / ILI"
+    scale_tag <- "linear y"
+  } else {
+    y_scale_layer <- scale_y_log10(
+      limits = y_lim_log, breaks = c(1, 2, 5, 10, 20),
+      oob = scales::squish
+    )
+    y_label <- "% of ED visits / ILI (log10)"
+    scale_tag <- "log y"
+  }
+
+  # Top panel: trajectories + median (carries the legend)
+  top_plot <- ggplot() +
+    base_layers + trajectory_layer + median_layers + y_scale_layer +
+    labs(x = NULL, y = y_label) +
+    theme(axis.text.x = element_blank(),
+          plot.title = element_text(face = "bold"))
+
+  # Bottom panel: 95% PI ribbon + median
+  bottom_plot <- ggplot() +
+    base_layers +
+    geom_ribbon(data = bands,
+                aes(x = target_end_date, ymin = lower, ymax = upper,
+                    fill = model_id),
+                alpha = 0.25) +
+    median_layers + y_scale_layer +
+    labs(x = "Target end date", y = y_label) +
+    theme(legend.position = "none")
+
+  (top_plot / bottom_plot) +
+    plot_layout(heights = c(1, 1)) +
+    plot_annotation(
+      title = title,
+      caption = sprintf("Reference date: %s (vertical dashed).", format(ref_date, "%Y-%m-%d")),
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 14),
+        plot.caption = element_text(colour = "grey40", size = 9)
+      )
+    )
+}
+
+# Score each forecaster on five scoring rules. Returns one row per model_id.
+# All five metrics are returned in loss form (lower is better), matching the
+# scoringutils conventions: `logs_sample` returns -log(estimated density at obs).
+score_forecasts <- function(forecast_df, oracle_df) {
+  models <- unique(forecast_df$model_id)
+  bind_rows(lapply(models, function(m) {
+    fd <- forecast_df |>
+      filter(model_id == m) |>
+      arrange(sample_id, target_end_date)
+    horizons <- sort(unique(fd$target_end_date))
+    # samples_per_horizon: rows = horizons, cols = samples
+    spm <- fd |>
+      select(sample_id, target_end_date, value) |>
+      pivot_wider(names_from = sample_id, values_from = value) |>
+      arrange(target_end_date) |>
+      select(-target_end_date) |>
+      as.matrix()
+    obs <- oracle_df |>
+      filter(target_end_date %in% horizons) |>
+      arrange(target_end_date) |>
+      pull(oracle_value)
+    # log-scale transform (log1p handles 0 if any)
+    spm_log <- log1p(spm)
+    obs_log <- log1p(obs)
+    # scoringutils convention for multivariate sample scores:
+    # observed = length-d vector, predicted = d x N matrix, mv_group_id of length d.
+    # All 4 horizons belong to ONE multivariate observation, so mv_group_id is all 1s.
+    mv_id <- rep(1L, length(obs))
+    tibble(
+      model_id     = m,
+      `CRPS`       = mean(crps_sample(observed = obs, predicted = spm)),
+      `CRPS (log)` = mean(crps_sample(observed = obs_log, predicted = spm_log)),
+      `LS`         = mean(logs_sample(observed = obs, predicted = spm)),
+      `ES`         = energy_score_multivariate(observed = obs, predicted = spm, mv_group_id = mv_id),
+      `VS`         = variogram_score_multivariate(observed = obs, predicted = spm, mv_group_id = mv_id, p = 0.5)
+    )
+  }))
+}
+
+# Helper to render the score table on an evaluation slide.
+# - Model labels are coloured to match the figure.
+# - Within each metric column the lower (better) value is shown in bold + that
+#   model's colour.
+#
+# The HTML is emitted inside a `{=html}` raw block so that pandoc / Quarto's
+# table post-processor does not strip the inline `style` attributes.
+score_table <- function(scores, model_colors) {
+  metric_cols <- setdiff(names(scores), "model_id")
+
+  bold_color <- function(value, hex) {
+    sprintf('<strong style="color:%s;">%s</strong>', hex, value)
+  }
+
+  # Header row
+  header_cells <- paste0(
+    '<th style="text-align:left;padding:0 0.4em;white-space:nowrap;">Model</th>',
+    paste0(sprintf('<th style="text-align:right;padding:0 0.4em;white-space:nowrap;">%s</th>', metric_cols),
+           collapse = "")
+  )
+
+  # Data rows
+  rows <- character(nrow(scores))
+  for (j in seq_len(nrow(scores))) {
+    m <- scores$model_id[j]
+    hex <- model_colors[[m]]
+    name_cell <- sprintf(
+      '<td style="text-align:left;padding:0 0.4em;white-space:nowrap;">%s</td>',
+      bold_color(m, hex)
+    )
+    metric_cells <- vapply(metric_cols, function(col) {
+      vals <- scores[[col]]
+      val_str <- formatC(vals[j], digits = 2, format = "f")
+      if (j == which.min(vals)) {
+        cell_content <- bold_color(val_str, hex)
+      } else {
+        cell_content <- val_str
+      }
+      sprintf('<td style="text-align:right;padding:0 0.4em;">%s</td>',
+              cell_content)
+    }, character(1))
+    rows[j] <- paste0("<tr>", name_cell, paste(metric_cells, collapse = ""), "</tr>")
+  }
+
+  html <- paste0(
+    '<table style="border-collapse:collapse;margin:0;">',
+    '<thead><tr>', header_cells, '</tr></thead>',
+    '<tbody>', paste(rows, collapse = ""), '</tbody>',
+    '</table>'
+  )
+
+  # Emit wrapped in raw-HTML block so Quarto leaves it alone.
+  cat("\n:::: {=html}\n", html, "\n::::\n", sep = "")
+  invisible(NULL)
+}
+```
+
+## {.unlisted}
+
+```{r ex1-setup}
+ex1_ref_date <- as.Date("2025-11-22")
+ex1_target_dates <- as.Date(c("2025-11-29", "2025-12-06",
+                              "2025-12-13", "2025-12-20"))
+
+# Model X: slightly increasing, shifted lognormal (floor at 2.0, asymmetric).
+# 95% PI covers truth at all 4 horizons with margin; lower 95% PI stays around 3.
+ex1_forecast_X <- generate_forecast(
+  "Model X",
+  medians = c(4.0, 4.5, 5.0, 5.5),
+  sds     = c(0.45, 0.50, 0.65, 0.70),    # log-scale sigma (above the floor)
+  dist    = "lognormal",
+  floor   = 2.0,
+  target_dates = ex1_target_dates,
+  seed = 101
+)
+
+# Model Y: more steeply increasing but all medians under truth, narrow normal.
+# 95% PI does not cover truth at any of h=1..4.
+ex1_forecast_Y <- generate_forecast(
+  "Model Y",
+  medians = c(4.5, 5.3, 7.0, 9.0),
+  sds     = c(0.40, 0.40, 0.75, 0.80),
+  dist    = "normal",
+  target_dates = ex1_target_dates,
+  seed = 202
+)
+
+ex1_forecasts <- bind_rows(ex1_forecast_X, ex1_forecast_Y)
+
+# Truth window: ~5 weeks of pre-reference history through the post-peak decline
+ex1_truth_window <- truth |>
+  filter(target_end_date >= as.Date("2025-10-25"),
+         target_end_date <= as.Date("2026-02-14"))
+```
+
+::: {.panel-tabset}
+
+### Natural scale
+
+```{r ex1-plot-lin, fig.width=11, fig.height=6.5}
+plot_forecast_panel(
+  ex1_truth_window, ex1_forecasts, ex1_ref_date,
+  title = "Example 1 — NYC ILI ED visits %, forecasts from 2025-11-22",
+  subtitle = "Model X: wide intervals, slow rise. Model Y: narrow intervals, steeper rise but always under truth.",
+  scale = "linear"
+)
+```
+
+### Log scale
+
+```{r ex1-plot-log, fig.width=11, fig.height=6.5}
+plot_forecast_panel(
+  ex1_truth_window, ex1_forecasts, ex1_ref_date,
+  title = "Example 1 — NYC ILI ED visits %, forecasts from 2025-11-22",
+  subtitle = "Model X: wide intervals, slow rise. Model Y: narrow intervals, steeper rise but always under truth.",
+  scale = "log"
+)
+```
+
+:::
+
+## {.unlisted}
+
+```{r ex1a-setup}
+# Same reference date and same Model X as Example 1. Model Y here is slightly
+# more biased low than Example 1's Y -- medians shifted down to (4.0, 4.5,
+# 5.5, 7.0). Y is still narrow and follows the rising shape, but the larger
+# absolute bias makes Y lose on linear CRPS (and CRPS-log, LS, ES) while it
+# still wins on the shape-only variogram score.
+ex1a_ref_date <- ex1_ref_date
+ex1a_target_dates <- ex1_target_dates
+
+ex1a_forecast_X <- generate_forecast(
+  "Model X",
+  medians = c(4.0, 4.5, 5.0, 5.5),
+  sds     = c(0.45, 0.50, 0.65, 0.70),
+  dist    = "lognormal",
+  floor   = 2.0,
+  target_dates = ex1a_target_dates,
+  seed = 101
+)
+
+ex1a_forecast_Y <- generate_forecast(
+  "Model Y",
+  medians = c(4.0, 4.5, 5.5, 7.0),
+  sds     = c(0.40, 0.40, 0.75, 0.80),
+  dist    = "normal",
+  target_dates = ex1a_target_dates,
+  seed = 202
+)
+
+ex1a_forecasts <- bind_rows(ex1a_forecast_X, ex1a_forecast_Y)
+ex1a_truth_window <- ex1_truth_window
+```
+
+::: {.panel-tabset}
+
+### Natural scale
+
+```{r ex1a-plot-lin, fig.width=11, fig.height=6.5}
+plot_forecast_panel(
+  ex1a_truth_window, ex1a_forecasts, ex1a_ref_date,
+  title = "Example 1a — NYC ILI ED visits %, forecasts from 2025-11-22",
+  subtitle = "Model X: same as Example 1 (wide, slow rise). Model Y: narrow, slightly more biased low than in Example 1.",
+  scale = "linear"
+)
+```
+
+### Log scale
+
+```{r ex1a-plot-log, fig.width=11, fig.height=6.5}
+plot_forecast_panel(
+  ex1a_truth_window, ex1a_forecasts, ex1a_ref_date,
+  title = "Example 1a — NYC ILI ED visits %, forecasts from 2025-11-22",
+  subtitle = "Model X: same as Example 1 (wide, slow rise). Model Y: narrow, slightly more biased low than in Example 1.",
+  scale = "log"
+)
+```
+
+:::
+
+## {.unlisted}
+
+```{r ex2-setup}
+# Reference date moved forward two weeks from Example 1.
+ex2_ref_date <- as.Date("2025-12-06")
+ex2_target_dates <- as.Date(c("2025-12-13", "2025-12-20",
+                              "2025-12-27", "2026-01-03"))
+
+# Model A: wide intervals, a small peak at h=2 then drifting down.
+# 95% PI covers truth at all 4 horizons (including the peak).
+ex2_forecast_A <- generate_forecast(
+  "Model A",
+  medians = c(6.0, 6.5, 5.0, 4.5),
+  sds     = c(0.45, 0.60, 0.60, 0.50),    # log-scale sigma (above the floor)
+  dist    = "lognormal",
+  floor   = 2.0,
+  target_dates = ex2_target_dates,
+  seed = 303
+)
+
+# Model B: biased high; a soft peak at h=2 with a flatter decline (less of a
+# clean mirror of the truth's rise-and-fall). Narrow normal: 95% PI does not
+# cover any horizon.
+ex2_forecast_B <- generate_forecast(
+  "Model B",
+  medians = c(10.5, 14.0, 13.5, 11.5),
+  sds     = c(0.55, 0.85, 0.85, 0.70),
+  dist    = "normal",
+  target_dates = ex2_target_dates,
+  seed = 404
+)
+
+ex2_forecasts <- bind_rows(ex2_forecast_A, ex2_forecast_B)
+
+# Truth window: same span as Example 1 so the curve looks identical.
+ex2_truth_window <- truth |>
+  filter(target_end_date >= as.Date("2025-10-25"),
+         target_end_date <= as.Date("2026-02-14"))
+```
+
+::: {.panel-tabset}
+
+### Natural scale
+
+```{r ex2-plot-lin, fig.width=11, fig.height=6.5}
+plot_forecast_panel(
+  ex2_truth_window, ex2_forecasts, ex2_ref_date,
+  title = "Example 2 — NYC ILI ED visits %, forecasts from 2025-12-06",
+  subtitle = "Model A: wide intervals, drifting down. Model B: narrow intervals, right trend but overshoots the peak.",
+  model_colors = c("Model A" = "#44AA99", "Model B" = "#AA4499"),
+  y_lim = c(0, 18),
+  scale = "linear"
+)
+```
+
+### Log scale
+
+```{r ex2-plot-log, fig.width=11, fig.height=6.5}
+plot_forecast_panel(
+  ex2_truth_window, ex2_forecasts, ex2_ref_date,
+  title = "Example 2 — NYC ILI ED visits %, forecasts from 2025-12-06",
+  subtitle = "Model A: wide intervals, drifting down. Model B: narrow intervals, right trend but overshoots the peak.",
+  model_colors = c("Model A" = "#44AA99", "Model B" = "#AA4499"),
+  y_lim = c(0, 18),
+  scale = "log"
+)
+```
+
+:::
+
+## Example 1 — scores {.smaller}
+
+::: {.columns}
+::: {.column width="58%"}
+
+::: {.panel-tabset}
+
+#### Natural
+
+```{r ex1-eval-plot-lin, fig.width=7, fig.height=5}
+plot_forecast_panel(
+  ex1_truth_window, ex1_forecasts, ex1_ref_date,
+  title = "Example 1 — NYC ILI ED visits %",
+  subtitle = "Forecasts from 2025-11-22",
+  scale = "linear"
+)
+```
+
+#### Log
+
+```{r ex1-eval-plot-log, fig.width=7, fig.height=5}
+plot_forecast_panel(
+  ex1_truth_window, ex1_forecasts, ex1_ref_date,
+  title = "Example 1 — NYC ILI ED visits %",
+  subtitle = "Forecasts from 2025-11-22",
+  scale = "log"
+)
+```
+
+:::
+
+:::
+::: {.column width="42%"}
+
+::: {style="font-size: 0.65em;"}
+
+```{r ex1-eval-table}
+#| results: asis
+score_forecasts(ex1_forecasts, truth) |>
+  score_table(model_colors = c("Model X" = "#4477AA",
+                               "Model Y" = "#DDAA33"))
+```
+
+:::
+
+*Lower is better for all five scores (log score is reported as the loss `-log(f(y))`).*
+
+:::
+:::
+
+## Example 1a — scores {.smaller}
+
+::: {.columns}
+::: {.column width="58%"}
+
+::: {.panel-tabset}
+
+#### Natural
+
+```{r ex1a-eval-plot-lin, fig.width=7, fig.height=5}
+plot_forecast_panel(
+  ex1a_truth_window, ex1a_forecasts, ex1a_ref_date,
+  title = "Example 1a — NYC ILI ED visits %",
+  subtitle = "Forecasts from 2025-11-22 (Y nudged lower)",
+  scale = "linear"
+)
+```
+
+#### Log
+
+```{r ex1a-eval-plot-log, fig.width=7, fig.height=5}
+plot_forecast_panel(
+  ex1a_truth_window, ex1a_forecasts, ex1a_ref_date,
+  title = "Example 1a — NYC ILI ED visits %",
+  subtitle = "Forecasts from 2025-11-22 (Y nudged lower)",
+  scale = "log"
+)
+```
+
+:::
+
+:::
+::: {.column width="42%"}
+
+::: {style="font-size: 0.65em;"}
+
+```{r ex1a-eval-table}
+#| results: asis
+score_forecasts(ex1a_forecasts, truth) |>
+  score_table(model_colors = c("Model X" = "#4477AA",
+                               "Model Y" = "#DDAA33"))
+```
+
+:::
+
+*Lower is better for all five scores (log score is reported as the loss `-log(f(y))`).*
+
+:::
+:::
+
+## Example 2 — scores {.smaller}
+
+::: {.columns}
+::: {.column width="58%"}
+
+::: {.panel-tabset}
+
+#### Natural
+
+```{r ex2-eval-plot-lin, fig.width=7, fig.height=5}
+plot_forecast_panel(
+  ex2_truth_window, ex2_forecasts, ex2_ref_date,
+  title = "Example 2 — NYC ILI ED visits %",
+  subtitle = "Forecasts from 2025-12-06",
+  model_colors = c("Model A" = "#44AA99", "Model B" = "#AA4499"),
+  y_lim = c(0, 18),
+  scale = "linear"
+)
+```
+
+#### Log
+
+```{r ex2-eval-plot-log, fig.width=7, fig.height=5}
+plot_forecast_panel(
+  ex2_truth_window, ex2_forecasts, ex2_ref_date,
+  title = "Example 2 — NYC ILI ED visits %",
+  subtitle = "Forecasts from 2025-12-06",
+  model_colors = c("Model A" = "#44AA99", "Model B" = "#AA4499"),
+  y_lim = c(0, 18),
+  scale = "log"
+)
+```
+
+:::
+
+:::
+::: {.column width="42%"}
+
+::: {style="font-size: 0.65em;"}
+
+```{r ex2-eval-table}
+#| results: asis
+score_forecasts(ex2_forecasts, truth) |>
+  score_table(model_colors = c("Model A" = "#44AA99",
+                               "Model B" = "#AA4499"))
+```
+
+:::
+
+*Lower is better for all five scores (log score is reported as the loss `-log(f(y))`).*
+
+:::
+:::

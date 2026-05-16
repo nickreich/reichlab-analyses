@@ -1,0 +1,162 @@
+---
+title: "Square-Root Velocity Functions"
+subtitle: "Intuition, propriety status, and use for trajectory forecast evaluation"
+author: "Claude (Anthropic) for Nicholas Reich"
+date: "2026-05-16"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 5
+)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+## The motivating problem
+
+Comparing curves shows up in many fields (handwriting, gait analysis, epidemic waves, growth curves). A recurring observation: **two curves can be "the same shape" but disagree everywhere pointwise** because one is stretched or shifted in time.
+
+Take two epidemic curves: same rise, same peak height, same decline, but one peaks at week 18 and the other at week 20. The standard $L^2$ distance
+
+$$\int_0^1 (f(t) - g(t))^2 \,dt$$
+
+is large, even though any visual reader would say "those are the same wave, just shifted by two weeks." So the question is: **how do you build a distance between curves that lets you align them in time first, and then compares what's left after alignment?**
+
+## Naive attempt and why it fails
+
+The obvious move: introduce a *warping function* $\gamma:[0,1] \to [0,1]$ - a monotone, smooth time-reparameterisation - and define
+
+$$d(f, g) = \min_{\gamma}\,\| f - g \circ \gamma \|_2.$$
+
+"Best alignment, then $L^2$." But there is a trap: **this distance is not invariant to which curve you reparameterise**, and the $L^2$ distance itself changes under reparameterisation. In general,
+
+$$\| f - g \|_2 \;\neq\; \| f \circ \gamma - g \circ \gamma \|_2.$$
+
+So you cannot even define "shape" cleanly - your answer depends on the arbitrary clock you happened to use to digitise the curves. The asymmetry is worse: $d(f, g) \neq d(g, f)$ for this naive construction.
+
+## The SRVF fix
+
+Define the **square-root velocity function** of a curve $f$:
+
+$$q_f(t) = \operatorname{sign}(f'(t)) \cdot \sqrt{|f'(t)|}.$$
+
+Take the velocity (derivative), and replace its magnitude with the square root of its magnitude. **The square root is the magic ingredient.**
+
+Under a reparameterisation $f \mapsto f \circ \gamma$, the SRVF transforms as
+
+$$q_{f \circ \gamma}(t) = q_f(\gamma(t)) \cdot \sqrt{\gamma'(t)}.$$
+
+That extra $\sqrt{\gamma'}$ factor is *exactly* what makes the $L^2$ norm on SRVFs invariant under reparameterisation:
+
+$$\| q_{f \circ \gamma} - q_{g \circ \gamma} \|_2 = \| q_f - q_g \|_2.$$
+
+Now you can define
+
+$$d_{\text{shape}}(f, g) = \min_{\gamma}\,\| q_f - q_{g \circ \gamma} \|_2$$
+
+and this is a *bona fide* metric: symmetric, well-defined, and invariant to the clock used to record either curve.
+
+## Why the square root specifically?
+
+The deep reason is that the SRVF is an isometry from "curves up to reparameterisation" into a subset of $L^2$. The space of shapes (curves modulo time-warping) is intrinsically curved, but the SRVF unfolds it into a flat space where plain $L^2$ geometry works. This is analogous to:
+
+- **Hellinger distance** between probability densities. The map $p \mapsto \sqrt{p}$ embeds densities into $L^2$ in a way the Fisher information metric likes. The Hellinger metric and the Fisher information metric coincide on this $L^2$ image.
+- **Fourier representations** that turn convolution into multiplication: a change-of-variables that swaps a hard problem for a routine one.
+
+You are doing a change of variables that swaps a hard problem (compare curves up to time-warping) for a routine one ($L^2$ distance plus a minimisation over warpings).
+
+### Sanity check of the invariance
+
+Compute $\| q_{f \circ \gamma} \|_2^2$ and use the change-of-variables $u = \gamma(t)$:
+
+$$\| q_{f \circ \gamma} \|_2^2 = \int_0^1 |f'(\gamma(t))|\,\gamma'(t)\,dt = \int_0^1 |f'(u)|\,du = \| q_f \|_2^2.$$
+
+The $\gamma'$ Jacobian from the SRVF transformation rule cancels exactly with the $du = \gamma'(t)\,dt$ from change-of-variables. This is the entire content of the invariance theorem.
+
+## What you get: phase / amplitude decomposition
+
+Once you have found the optimal $\gamma^*$, you can split error into two interpretable pieces:
+
+- **Amplitude error**: $\| q_f - q_{g \circ \gamma^*} \|_2$ - what is left after optimal time-alignment. Captures shape and magnitude mismatch.
+- **Phase error**: a measure of how far $\gamma^*$ is from the identity warp (e.g., a Fisher-Rao distance between $\gamma^*$ and the identity on the space of warps). Captures timing mismatch.
+
+For an epi forecast this is operationally clean:
+
+- "Your forecast was two weeks early but had the right peak height" - small amplitude error, moderate phase error.
+- "Your forecast was on-time but undershot the peak by 40%" - moderate amplitude error, near-zero phase error.
+- "Your forecast was both mistimed and miscalibrated" - both components large.
+
+Marginal CRPS and even the variogram score cannot decompose into these axes; SRVF can.
+
+## Is SRVF a proper scoring rule?
+
+**No - and the distinction matters.**
+
+SRVF distance is a proper distance metric on shape space (after optimal time-warping it gives the Fisher-Rao geodesic distance: symmetric, satisfies the triangle inequality, positive definite). But "proper distance metric" and "proper scoring rule" are different concepts.
+
+A proper scoring rule in the Gneiting-Raftery sense satisfies
+
+$$\mathbb{E}_{y \sim P}\,S(P, y) \;\le\; \mathbb{E}_{y \sim P}\,S(F, y) \quad \text{for all } F, P,$$
+
+i.e., the *true* predictive distribution minimises the expected score in expectation. SRVF distance applied to (median forecast, observed truth) is a point-forecast loss - analogous to MAE on a curve. It is not a function of a *distribution* at all, so it cannot be proper or improper in the Gneiting-Raftery sense; it is just an error metric.
+
+There are two ways SRVF could be made into a proper scoring rule, with caveats.
+
+### Option 1: energy-score construction
+
+Define
+
+$$S_d(F, y) = \mathbb{E}_F\,d(X, y) - \tfrac{1}{2}\,\mathbb{E}_F\,d(X, X')$$
+
+with $d$ = SRVF distance. This is strictly proper iff $d$ corresponds to a strictly negative-definite kernel of order 1 (Gneiting & Raftery 2007, Theorem 5; Sejdinovic, Sriperumbudur, Gretton & Fukumizu 2013). For Euclidean $d$ this holds, which is why the standard energy score is strictly proper.
+
+**For SRVF distance the negative-definiteness condition is not, to my knowledge, established in the published literature.** The SRVF metric inherits the curvature of shape space; it is locally Euclidean but globally Riemannian, and that is exactly where the negative-definiteness argument can fail.
+
+### Option 2: kernel-score construction
+
+Build a positive-definite kernel $k(f_1, f_2)$ from SRVF features - for example,
+
+$$k(f_1, f_2) = \exp\!\big(-d_{\text{SRVF}}(f_1, f_2)^2 / 2\sigma^2\big)$$
+
+if you can show that kernel is positive semi-definite. Use the MMD-based kernel score, which is strictly proper for any characteristic kernel (Allen, Ginsbourger & Ziegel 2022, "Transformed Kernel Scores", *SIAM/ASA JUQ*). Whether the SRVF-Gaussian kernel is characteristic is again an open question - it depends on properties of the shape-space embedding that have not been published.
+
+### Practical takeaway
+
+SRVF is great for *diagnostics* (separately reporting phase and amplitude error against the median trajectory) and for *visualising* what a shape-aware metric "sees", but I would not use it as a primary proper scoring rule without a published propriety proof.
+
+For sample-based trajectory forecasts where you want a proper rule, stick with:
+
+- variogram score,
+- energy score,
+- threshold-weighted CRPS,
+- CRPS on derived functionals.
+
+All four have established propriety. Use SRVF alongside them as a complementary, interpretable diagnostic.
+
+## Pragmatic notes for getting started
+
+- **Reference text**: Srivastava & Klassen, *Functional and Shape Data Analysis* (Springer, 2016) is the standard textbook. Marron, Ramsay, Sangalli & Srivastava (2015, *Statistical Science*) is a shorter introduction and already lives in the bibliography.
+- **R**: `fdasrvf` (Tucker, on CRAN). Start with `time_warping()` for a curve sample and `pair_align_functions()` to align two curves.
+- **Python**: `fdasrsf` (same author). `scikit-fda` has a registration submodule.
+- The minimisation over $\gamma$ is done by dynamic programming on a discretised grid. **Under the hood this is a DTW-like algorithm** - SRVF is essentially "DTW done right" from a metric-geometry perspective: the SRVF representation is what makes the dynamic-programming alignment problem produce a true metric rather than just a heuristic distance.
+
+## Mental picture
+
+> SRVF is to "comparing curves up to time-warping" what the Hellinger distance is to "comparing probability distributions". A square-root rescaling that turns an awkward, curved space into one where $L^2$ geometry just works.
+
+## References
+
+- Allen, S., Ginsbourger, D., & Fasciati-Ziegel, J. (2022). Evaluating forecasts for high-impact events using transformed kernel scores. *SIAM/ASA Journal on Uncertainty Quantification*. https://doi.org/10.1137/22m1532184
+- Gneiting, T., & Raftery, A. E. (2007). Strictly proper scoring rules, prediction, and estimation. *Journal of the American Statistical Association*, *102*(477), 359-378. https://doi.org/10.1198/016214506000001437
+- Marron, J. S., Ramsay, J. O., Sangalli, L. M., & Srivastava, A. (2015). Functional data analysis of amplitude and phase variation. *Statistical Science*, *30*(4), 468-484. https://doi.org/10.1214/15-STS524
+- Sejdinovic, D., Sriperumbudur, B., Gretton, A., & Fukumizu, K. (2013). Equivalence of distance-based and RKHS-based statistics in hypothesis testing. *Annals of Statistics*, *41*(5), 2263-2291.
+- Srivastava, A., & Klassen, E. P. (2016). *Functional and Shape Data Analysis*. Springer.
+
+See also `bibliography.md` in this directory for the broader citation context on trajectory-aware scoring rules.

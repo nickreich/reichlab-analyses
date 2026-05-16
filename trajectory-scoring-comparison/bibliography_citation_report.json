@@ -1,0 +1,325 @@
+{
+  "total_dois": 35,
+  "verified": [
+    "10.1287/mnsc.22.10.1087",
+    "10.1198/016214506000001437",
+    "10.1111/j.1467-9868.2007.00587.x",
+    "10.1371/journal.pcbi.1008618",
+    "10.1214/aos/1018031101",
+    "10.1198/jbes.2010.08110",
+    "10.1175/MWR-D-14-00269.1",
+    "10.1007/s11749-008-0114-x",
+    "10.1175/WAF-D-22-0161.1",
+    "10.1002/qj.2624",
+    "10.1073/pnas.2113561119",
+    "10.7554/eLife.81916",
+    "10.1038/s41467-021-25207-0",
+    "10.1016/j.ijforecast.2020.07.002",
+    "10.3233/IDA-2007-11508",
+    "10.1142/S0218195995000064",
+    "10.1111/1467-9868.00129",
+    "10.1214/15-STS524",
+    "10.1073/pnas.1812594116",
+    "10.1371/journal.pcbi.1007486",
+    "10.1371/journal.pcbi.1006134",
+    "10.1016/j.epidem.2018.02.003",
+    "10.1038/s41598-018-36361-9",
+    "10.1371/journal.pcbi.1006785",
+    "10.1002/sim.7363",
+    "10.1371/journal.pcbi.1010485",
+    "10.1214/16-STS588",
+    "10.1080/07350015.2019.1585256",
+    "10.1371/journal.pcbi.1011393",
+    "10.1146/annurev-statistics-032921-020240",
+    "10.1016/j.ijforecast.2022.07.003",
+    "10.48550/arXiv.2408.09770",
+    "10.48550/arXiv.2505.00937"
+  ],
+  "failed": [
+    "10.1175/1520-0434(2000",
+    "10.1175/1520-0450(1967"
+  ],
+  "metadata": {
+    "10.1287/mnsc.22.10.1087": {
+      "title": "Scoring Rules for Continuous Probability Distributions",
+      "authors": "Matheson, J., Winkler, R.",
+      "year": "1976",
+      "journal": "Management Science",
+      "volume": "22",
+      "pages": "1087-1096",
+      "doi": "10.1287/mnsc.22.10.1087"
+    },
+    "10.1198/016214506000001437": {
+      "title": "Strictly Proper Scoring Rules, Prediction, and Estimation",
+      "authors": "Gneiting, T., Raftery, A.",
+      "year": "2007",
+      "journal": "Journal of the American Statistical Association",
+      "volume": "102",
+      "pages": "359-378",
+      "doi": "10.1198/016214506000001437"
+    },
+    "10.1111/j.1467-9868.2007.00587.x": {
+      "title": "Probabilistic Forecasts, Calibration and Sharpness",
+      "authors": "Gneiting, T., Balabdaoui, F., Raftery, A.",
+      "year": "2007",
+      "journal": "Journal of the Royal Statistical Society Series B: Statistical Methodology",
+      "volume": "69",
+      "pages": "243-268",
+      "doi": "10.1111/j.1467-9868.2007.00587.x"
+    },
+    "10.1371/journal.pcbi.1008618": {
+      "title": "Evaluating epidemic forecasts in an interval format",
+      "authors": "Bracher, J., Ray, E., Gneiting, T., et al.",
+      "year": "2021",
+      "journal": "PLOS Computational Biology",
+      "volume": "17",
+      "pages": "e1008618",
+      "doi": "10.1371/journal.pcbi.1008618"
+    },
+    "10.1214/aos/1018031101": {
+      "title": "Coherent dispersion criteria for optimal experimental design",
+      "authors": "Dawid, A., Sebastiani, P.",
+      "year": "1999",
+      "journal": "The Annals of Statistics",
+      "volume": "27",
+      "pages": "",
+      "doi": "10.1214/aos/1018031101"
+    },
+    "10.1198/jbes.2010.08110": {
+      "title": "Comparing Density Forecasts Using Threshold- and Quantile-Weighted Scoring Rules",
+      "authors": "Gneiting, T., Ranjan, R.",
+      "year": "2011",
+      "journal": "Journal of Business &amp; Economic Statistics",
+      "volume": "29",
+      "pages": "411-422",
+      "doi": "10.1198/jbes.2010.08110"
+    },
+    "10.1175/MWR-D-14-00269.1": {
+      "title": "Variogram-Based Proper Scoring Rules for Probabilistic Forecasts of Multivariate Quantities*",
+      "authors": "Scheuerer, M., Hamill, T.",
+      "year": "2015",
+      "journal": "Monthly Weather Review",
+      "volume": "143",
+      "pages": "1321-1334",
+      "doi": "10.1175/MWR-D-14-00269.1"
+    },
+    "10.1007/s11749-008-0114-x": {
+      "title": "Assessing probabilistic forecasts of multivariate quantities, with an application to ensemble predictions of surface winds",
+      "authors": "Gneiting, T., Stanberry, L., Grimit, E., et al.",
+      "year": "2008",
+      "journal": "TEST",
+      "volume": "17",
+      "pages": "211-235",
+      "doi": "10.1007/s11749-008-0114-x"
+    },
+    "10.1175/WAF-D-22-0161.1": {
+      "title": "Weighted Verification Tools to Evaluate Univariate and Multivariate Probabilistic Forecasts for High-Impact Weather Events",
+      "authors": "Allen, S., Bhend, J., Martius, O., et al.",
+      "year": "2023",
+      "journal": "Weather and Forecasting",
+      "volume": "38",
+      "pages": "499-516",
+      "doi": "10.1175/WAF-D-22-0161.1"
+    },
+    "10.1002/qj.2624": {
+      "title": "Quantile forecast discrimination ability and value",
+      "authors": "Ben Bouall\u00e8gue, Z., Pinson, P., Friederichs, P.",
+      "year": "2015",
+      "journal": "Quarterly Journal of the Royal Meteorological Society",
+      "volume": "141",
+      "pages": "3415-3424",
+      "doi": "10.1002/qj.2624"
+    },
+    "10.1073/pnas.2113561119": {
+      "title": "Evaluation of individual and ensemble probabilistic forecasts of COVID-19 mortality in the United States",
+      "authors": "Cramer, E., Ray, E., Lopez, V., et al.",
+      "year": "2022",
+      "journal": "Proceedings of the National Academy of Sciences",
+      "volume": "119",
+      "pages": "",
+      "doi": "10.1073/pnas.2113561119"
+    },
+    "10.7554/eLife.81916": {
+      "title": "Predictive performance of multi-model ensemble forecasts of COVID-19 across European nations",
+      "authors": "Sherratt, K., Gruson, H., Grah, R., et al.",
+      "year": "2023",
+      "journal": "eLife",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.7554/eLife.81916"
+    },
+    "10.1038/s41467-021-25207-0": {
+      "title": "A pre-registered short-term forecasting study of COVID-19 in Germany and Poland during the second wave",
+      "authors": "Bracher, J., Wolffram, D., Deuschel, J., et al.",
+      "year": "2021",
+      "journal": "Nature Communications",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41467-021-25207-0"
+    },
+    "10.1016/j.ijforecast.2020.07.002": {
+      "title": "Endemic-epidemic models with discrete-time serial interval distributions for infectious disease prediction",
+      "authors": "Bracher, J., Held, L.",
+      "year": "2022",
+      "journal": "International Journal of Forecasting",
+      "volume": "38",
+      "pages": "1221-1233",
+      "doi": "10.1016/j.ijforecast.2020.07.002"
+    },
+    "10.3233/IDA-2007-11508": {
+      "title": "Toward accurate dynamic time warping in linear time and space",
+      "authors": "Salvador, S., Chan, P.",
+      "year": "2007",
+      "journal": "Intelligent Data Analysis",
+      "volume": "11",
+      "pages": "561-580",
+      "doi": "10.3233/IDA-2007-11508"
+    },
+    "10.1142/S0218195995000064": {
+      "title": "COMPUTING THE FR\u00c9CHET DISTANCE BETWEEN TWO POLYGONAL CURVES",
+      "authors": "ALT, H., GODAU, M.",
+      "year": "1995",
+      "journal": "International Journal of Computational Geometry &amp; Applications",
+      "volume": "05",
+      "pages": "75-91",
+      "doi": "10.1142/S0218195995000064"
+    },
+    "10.1111/1467-9868.00129": {
+      "title": "Curve Registration",
+      "authors": "Ramsay, J., Li, X.",
+      "year": "1998",
+      "journal": "Journal of the Royal Statistical Society Series B: Statistical Methodology",
+      "volume": "60",
+      "pages": "351-363",
+      "doi": "10.1111/1467-9868.00129"
+    },
+    "10.1214/15-STS524": {
+      "title": "Functional Data Analysis of Amplitude and Phase Variation",
+      "authors": "Marron, J., Ramsay, J., Sangalli, L., et al.",
+      "year": "2015",
+      "journal": "Statistical Science",
+      "volume": "30",
+      "pages": "",
+      "doi": "10.1214/15-STS524"
+    },
+    "10.1073/pnas.1812594116": {
+      "title": "A collaborative multiyear, multimodel assessment of seasonal influenza forecasting in the United States",
+      "authors": "Reich, N., Brooks, L., Fox, S., et al.",
+      "year": "2019",
+      "journal": "Proceedings of the National Academy of Sciences",
+      "volume": "116",
+      "pages": "3146-3154",
+      "doi": "10.1073/pnas.1812594116"
+    },
+    "10.1371/journal.pcbi.1007486": {
+      "title": "Accuracy of real-time multi-model ensemble forecasts for seasonal influenza in the U.S.",
+      "authors": "Reich, N., McGowan, C., Yamana, T., et al.",
+      "year": "2019",
+      "journal": "PLOS Computational Biology",
+      "volume": "15",
+      "pages": "e1007486",
+      "doi": "10.1371/journal.pcbi.1007486"
+    },
+    "10.1371/journal.pcbi.1006134": {
+      "title": "Nonmechanistic forecasts of seasonal influenza with iterative one-week-ahead distributions",
+      "authors": "Brooks, L., Farrow, D., Hyun, S., et al.",
+      "year": "2018",
+      "journal": "PLOS Computational Biology",
+      "volume": "14",
+      "pages": "e1006134",
+      "doi": "10.1371/journal.pcbi.1006134"
+    },
+    "10.1016/j.epidem.2018.02.003": {
+      "title": "Results from the second year of a collaborative effort to forecast influenza seasons in the United States",
+      "authors": "Biggerstaff, M., Johansson, M., Alper, D., et al.",
+      "year": "2018",
+      "journal": "Epidemics",
+      "volume": "24",
+      "pages": "26-33",
+      "doi": "10.1016/j.epidem.2018.02.003"
+    },
+    "10.1038/s41598-018-36361-9": {
+      "title": "Collaborative efforts to forecast seasonal influenza in the United States, 2015\u20132016",
+      "authors": "McGowan, C., Biggerstaff, M., Johansson, M., et al.",
+      "year": "2019",
+      "journal": "Scientific Reports",
+      "volume": "9",
+      "pages": "",
+      "doi": "10.1038/s41598-018-36361-9"
+    },
+    "10.1371/journal.pcbi.1006785": {
+      "title": "Assessing the performance of real-time epidemic forecasts: A case study of Ebola in the Western Area region of Sierra Leone, 2014-15",
+      "authors": "Funk, S., Camacho, A., Kucharski, A., et al.",
+      "year": "2019",
+      "journal": "PLOS Computational Biology",
+      "volume": "15",
+      "pages": "e1006785",
+      "doi": "10.1371/journal.pcbi.1006785"
+    },
+    "10.1002/sim.7363": {
+      "title": "Probabilistic forecasting in infectious disease epidemiology: the 13th Armitage lecture",
+      "authors": "Held, L., Meyer, S., Bracher, J.",
+      "year": "2017",
+      "journal": "Statistics in Medicine",
+      "volume": "36",
+      "pages": "3443-3460",
+      "doi": "10.1002/sim.7363"
+    },
+    "10.1371/journal.pcbi.1010485": {
+      "title": "An expert judgment model to predict early stages of the COVID-19 pandemic in the United States",
+      "authors": "McAndrew, T., Reich, N.",
+      "year": "2022",
+      "journal": "PLOS Computational Biology",
+      "volume": "18",
+      "pages": "e1010485",
+      "doi": "10.1371/journal.pcbi.1010485"
+    },
+    "10.1214/16-STS588": {
+      "title": "Forecaster\u2019s Dilemma: Extreme Events and Forecast Evaluation",
+      "authors": "Lerch, S., Thorarinsdottir, T., Ravazzolo, F., et al.",
+      "year": "2017",
+      "journal": "Statistical Science",
+      "volume": "32",
+      "pages": "",
+      "doi": "10.1214/16-STS588"
+    },
+    "10.1080/07350015.2019.1585256": {
+      "title": "Comparing Possibly Misspecified Forecasts",
+      "authors": "Patton, A.",
+      "year": "2020",
+      "journal": "Journal of Business &amp; Economic Statistics",
+      "volume": "38",
+      "pages": "796-809",
+      "doi": "10.1080/07350015.2019.1585256"
+    },
+    "10.1371/journal.pcbi.1011393": {
+      "title": "Scoring epidemiological forecasts on transformed scales",
+      "authors": "Bosse, N., Abbott, S., Cori, A., et al.",
+      "year": "2023",
+      "journal": "PLOS Computational Biology",
+      "volume": "19",
+      "pages": "e1011393",
+      "doi": "10.1371/journal.pcbi.1011393"
+    },
+    "10.1146/annurev-statistics-032921-020240": {
+      "title": "Model Diagnostics and Forecast Evaluation for Quantiles",
+      "authors": "Gneiting, T., Wolffram, D., Resin, J., et al.",
+      "year": "2023",
+      "journal": "Annual Review of Statistics and Its Application",
+      "volume": "10",
+      "pages": "597-621",
+      "doi": "10.1146/annurev-statistics-032921-020240"
+    },
+    "10.1016/j.ijforecast.2022.07.003": {
+      "title": "Evaluating probabilistic forecasts of extremes using continuous ranked probability score distributions",
+      "authors": "Taillardat, M., Foug\u00e8res, A., Naveau, P., et al.",
+      "year": "2023",
+      "journal": "International Journal of Forecasting",
+      "volume": "39",
+      "pages": "1448-1459",
+      "doi": "10.1016/j.ijforecast.2022.07.003"
+    },
+    "10.48550/arXiv.2408.09770": {},
+    "10.48550/arXiv.2505.00937": {}
+  }
+}
